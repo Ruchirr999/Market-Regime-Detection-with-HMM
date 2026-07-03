@@ -77,6 +77,14 @@ titles, and only reported one all-time backtest number.
   price series (e.g. synthetic data, a CSV, a cached download), not only
   a live `yfinance` call. `run("RELIANCE")` still works exactly as before
   and defaults to `yfinance`.
+- **Robust walk-forward fitting** — `walk_forward_regimes` now validates
+  each HMM fit before accepting it, checking that `startprob_`,
+  `transmat_`, and `means_` are all finite. If a fit produces NaNs (which
+  can happen on short or low-variance training windows, e.g. recently
+  listed tickers), the previous valid model is kept instead of propagating
+  a broken model into `predict()`. This fixes a `ValueError: startprob_
+  must sum to 1 (got nan)` crash that could occur on tickers with limited
+  history or flat price periods.
 
 ## Usage
 

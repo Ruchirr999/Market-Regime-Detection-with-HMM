@@ -70,21 +70,25 @@ def make_output_dirs(label: str, root: str = "outputs") -> dict:
 # Ticker handling
 # --------------------------------------------------------------------------
 
-def resolve_ticker(stock_input: str) -> tuple[str, str]:
+def resolve_ticker(stock_input: str) -> tuple[str, str, str]:
     """
     Turns user input into a yfinance ticker + a clean label for filenames.
     - "NSEI" / "NIFTY" / "NIFTY50" -> the index itself (^NSEI)
     - anything else -> assumed to be an NSE-listed stock, gets ".NS" appended
       unless the user already typed a suffix (e.g. "RELIANCE.NS").
-    NOTE: this assumes NSE by default -- it won't correctly resolve US
-    tickers like "AAPL" (would wrongly try "AAPL.NS"). Fine for your use
-    case, but worth knowing if you ever point this at non-Indian stocks.
+
+    Returns (ticker, label, fallback_ticker):
+      - `ticker` is the NSE-assumed candidate to try first (e.g. "AAPL.NS").
+      - `fallback_ticker` is the raw, unmodified input (e.g. "AAPL"), which
+        the caller can retry with if the NSE-suffixed candidate returns no
+        data -- this is what makes a US ticker like "AAPL" work correctly
+        instead of only ever trying (and failing on) "AAPL.NS".
     """
     raw = stock_input.strip().upper()
     index_aliases = {"NSEI", "NIFTY", "NIFTY50", "NIFTY 50", "^NSEI"}
 
     if raw in index_aliases:
-        return "^NSEI", "NIFTY50"
+        return "^NSEI", "NIFTY50", "^NSEI"
 
     if "." in raw or raw.startswith("^"):
         ticker = raw
@@ -92,7 +96,7 @@ def resolve_ticker(stock_input: str) -> tuple[str, str]:
         ticker = f"{raw}.NS"
 
     label = raw.replace(".", "_").replace("^", "")
-    return ticker, label
+    return ticker, label, raw
 
 
 def classify_bullish_bearish(ann_return_pct: float) -> str:
@@ -300,6 +304,13 @@ def label_regimes(model: GaussianHMM, features: pd.DataFrame) -> pd.Series:
 def describe_regimes(features: pd.DataFrame, regimes: pd.Series):
     """Print mean return / vol per regime so you can sanity check what
     each state actually represents before trusting it."""
+    if len(regimes) == 0:
+        raise ValueError(
+            "describe_regimes: regimes is empty, so there's nothing to "
+            "summarize. This usually means walk_forward_regimes() was given "
+            "less history than it could label -- check the NOTE/error it "
+            "printed above."
+        )
     summary = features.groupby(regimes).agg(
         mean_return=("return", "mean"),
         volatility=("volatility", "mean"),
@@ -310,13 +321,31 @@ def describe_regimes(features: pd.DataFrame, regimes: pd.Series):
     return summary
 
 
+MIN_VIABLE_TRAIN_ROWS = 60  # below this, an HMM fit is too noisy to trust at all
+
+
 def walk_forward_regimes(features: pd.DataFrame, n_states: int,
                           min_train: int = 500, refit_every: int = 21,
                           n_iter: int = 100) -> pd.Series:
-    """Causal regime labeling: at each point in time, the regime label
-    only depends on data up to that day. No future information leaks in."""
     values = features.values
     n = len(values)
+
+    if n < MIN_VIABLE_TRAIN_ROWS + 5:
+        raise ValueError(
+            f"walk_forward_regimes: only {n} feature rows are available for "
+            f"this ticker -- that's too little history for any HMM fit to be "
+            f"meaningful (need at least ~{MIN_VIABLE_TRAIN_ROWS + 5} trading "
+            f"days). This ticker is likely too recently listed, or the date "
+            f"range is too short. Try a longer history or a different ticker."
+        )
+
+    if min_train >= n:
+        adjusted = max(MIN_VIABLE_TRAIN_ROWS, int(n * 0.6))
+        adjusted = min(adjusted, n - 5)
+        print(f"NOTE: min_train={min_train} but only {n} feature rows are "
+              f"available for this ticker. Shrinking min_train to {adjusted}.")
+        min_train = adjusted
+
     regimes = pd.Series(index=features.index, dtype=float)
 
     model = None
@@ -326,25 +355,45 @@ def walk_forward_regimes(features: pd.DataFrame, n_states: int,
     for t in range(min_train, n):
         if model is None or (t - last_refit) >= refit_every:
             train_data = values[:t]
-            model = GaussianHMM(n_components=n_states, covariance_type="diag",
-                                 n_iter=n_iter, random_state=42)
+            candidate = GaussianHMM(n_components=n_states, covariance_type="diag",
+                                    n_iter=n_iter, random_state=42)
+            fit_ok = False
             try:
-                model.fit(train_data)
-            except Exception:
-                pass
-            last_refit = t
+                candidate.fit(train_data)
+                # Validate the model before accepting it: a failed fit leaves
+                # startprob_ / transmat_ with NaNs, which causes predict() to
+                # raise "startprob_ must sum to 1 (got nan)".
+                if (np.isfinite(candidate.startprob_).all() and
+                        np.isfinite(candidate.transmat_).all() and
+                        np.isfinite(candidate.means_).all()):
+                    fit_ok = True
+            except Exception as e:
+                print(f"  [walk_forward] HMM fit failed at t={t}: {e} -- "
+                      f"keeping previous model.")
 
-            train_states = model.predict(train_data)
-            return_col = features.columns.get_loc("return")
-            state_means = [train_data[train_states == s, return_col].mean()
-                           if (train_states == s).any() else 0.0
-                           for s in range(n_states)]
-            order = np.argsort(state_means)
-            remap = {old: new for new, old in enumerate(order)}
+            if fit_ok:
+                model = candidate
+                last_refit = t
 
-        window = values[:t + 1]
-        state_seq = model.predict(window)
-        regimes.iloc[t] = remap[state_seq[-1]]
+                train_states = model.predict(train_data)
+                return_col = features.columns.get_loc("return")
+                state_means = [train_data[train_states == s, return_col].mean()
+                               if (train_states == s).any() else 0.0
+                               for s in range(n_states)]
+                order = np.argsort(state_means)
+                remap = {old: new for new, old in enumerate(order)}
+
+        # If we still have no valid model yet, skip this day
+        if model is None or remap is None:
+            continue
+
+        try:
+            window = values[:t + 1]
+            state_seq = model.predict(window)
+            regimes.iloc[t] = remap[state_seq[-1]]
+        except Exception:
+            # predict failed for this day (e.g. degenerate window) -- leave NaN
+            pass
 
     regimes = regimes.dropna().astype(int)
     return regimes
@@ -364,6 +413,13 @@ def backtest_regime_strategy(prices: pd.Series, features: pd.DataFrame,
     (default: lowest-return state), then hold cash. Compare vs buy-and-hold.
     This is NOT investment advice -- it's a demonstration of whether the
     regime labels carry any signal at all."""
+    if len(features) == 0:
+        raise ValueError(
+            "backtest_regime_strategy: features is empty, so there are no "
+            "days to backtest. This usually means walk_forward_regimes() "
+            "was given less history than it could label -- check the "
+            "NOTE/error it printed above."
+        )
     aligned_prices = prices.loc[features.index]
     daily_ret = aligned_prices.pct_change().fillna(0)
 
@@ -448,17 +504,84 @@ def monthly_backtest_breakdown(prices: pd.Series, features: pd.DataFrame,
 
 
 # --------------------------------------------------------------------------
+# Price loading
+# --------------------------------------------------------------------------
+
+def _download_prices(ticker: str) -> pd.Series:
+    """Downloads close prices for a single ticker from yfinance and
+    normalizes to a clean, dropna'd pd.Series (empty Series if nothing
+    was found -- yfinance doesn't raise on an unknown/delisted ticker,
+    it just returns an empty frame, so callers must check for that)."""
+    import yfinance as yf
+    raw = yf.download(ticker, start="2015-01-01")["Close"]
+    prices = raw.dropna()
+    if isinstance(prices, pd.DataFrame):
+        prices = prices.iloc[:, 0]
+    return prices
+
+
+def load_prices_with_fallback(ticker: str, fallback_ticker: str) -> tuple[pd.Series, str]:
+    """Tries `ticker` first (the NSE-assumed candidate, e.g. "AAPL.NS").
+    If that returns no data, retries with `fallback_ticker` (the raw,
+    unmodified input, e.g. "AAPL") -- this is what makes tickers from
+    exchanges other than NSE (US stocks like AAPL, MSFT, etc.) work
+    correctly instead of always failing silently on a wrongly-guessed
+    ".NS" suffix. Raises a clear error if neither candidate has data,
+    instead of letting an empty price series propagate downstream into
+    a confusing HMM/array error.
+
+    Returns (prices, ticker_actually_used).
+    """
+    prices = _download_prices(ticker)
+    if not prices.empty:
+        return prices, ticker
+
+    if fallback_ticker != ticker:
+        print(f"NOTE: no data found for '{ticker}' -- retrying as "
+              f"'{fallback_ticker}' (looks like this isn't an NSE-listed "
+              f"ticker).")
+        prices = _download_prices(fallback_ticker)
+        if not prices.empty:
+            return prices, fallback_ticker
+
+    tried = ticker if fallback_ticker == ticker else f"{ticker} and {fallback_ticker}"
+    raise ValueError(
+        f"No price data found for '{ticker}' (tried: {tried}). "
+        f"Double-check the ticker symbol -- for NSE stocks just the plain "
+        f"name (e.g. 'RELIANCE') or explicit '.NS' suffix works, for "
+        f"US/other-exchange stocks use the plain ticker (e.g. 'AAPL') or "
+        f"the correct Yahoo Finance suffix for that exchange."
+    )
+
+
+# --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
 
-def run(stock_input: str, data_loader=None):
+# Walk-forward defaults. These are *targets*, not hard requirements --
+# run() scales them down automatically for tickers with limited history
+# (e.g. recent IPOs) instead of crashing.
+DEFAULT_MIN_TRAIN = 500       # preferred training window before labeling starts
+MIN_TRAIN_FLOOR = 100         # below this, an HMM fit is too unstable to trust
+MIN_WALK_FORWARD_TEST_DAYS = 60  # need at least ~3 months of labeled days for
+                                  # the walk-forward backtest/verdict to mean anything
+
+
+def run(stock_input: str, data_loader=None, min_train: int = None, refit_every: int = 21):
     """
     data_loader: callable(ticker:str) -> pd.Series of close prices,
     indexed by date. Defaults to yfinance if not provided. Injectable so
     the pipeline can be tested/run against any price source, not just
     Yahoo Finance.
+
+    min_train: how many days of history to require before the walk-forward
+    model starts labeling regimes. Defaults to None, which auto-scales:
+    uses 500 if the ticker has enough history, otherwise shrinks it (down
+    to MIN_TRAIN_FLOOR) so there are still at least
+    MIN_WALK_FORWARD_TEST_DAYS days left to actually walk-forward test on.
+    Pass an explicit int to override.
     """
-    ticker, label = resolve_ticker(stock_input)
+    ticker, label, fallback_ticker = resolve_ticker(stock_input)
     paths = make_output_dirs(label)
 
     tee = Tee(paths["report_txt"])
@@ -466,16 +589,19 @@ def run(stock_input: str, data_loader=None):
     sys.stdout = tee
     try:
         print(f"Run started: {datetime.now().isoformat(timespec='seconds')}")
-        print(f"Ticker: {ticker}  |  Label: {label}")
+        print(f"Ticker candidate: {ticker}  |  Label: {label}")
 
         if data_loader is None:
-            import yfinance as yf
-            raw = yf.download(ticker, start="2015-01-01")["Close"]
-            prices = raw.dropna()
-            if isinstance(prices, pd.DataFrame):
-                prices = prices.iloc[:, 0]
+            prices, ticker_used = load_prices_with_fallback(ticker, fallback_ticker)
+            print(f"Ticker used: {ticker_used}")
         else:
             prices = data_loader(ticker)
+
+        if prices.empty:
+            raise ValueError(
+                f"No price data available for '{stock_input}' -- cannot "
+                f"continue."
+            )
 
         features = build_features(prices)
 
@@ -490,10 +616,14 @@ def run(stock_input: str, data_loader=None):
                      save_path=os.path.join(paths["plots"], f"{label}_regimes_lookahead.png"))
 
         print(f"\n\n=== 2. Walk-forward causal fit for {label} (honest version) ===")
+        requested_min_train = 500 if min_train is None else min_train
         wf_regimes = walk_forward_regimes(features, n_states=k,
-                                           min_train=500, refit_every=21)
+                                           min_train=requested_min_train,
+                                           refit_every=refit_every)
         wf_features = features.loc[wf_regimes.index]
-        print(f"Labeled {len(wf_regimes)} days (first 500 held out as min training window)")
+        held_out = len(features) - len(wf_regimes)
+        print(f"Labeled {len(wf_regimes)} days (first {held_out} held out as "
+              f"the initial training window)")
         wf_stats = describe_regimes(wf_features, wf_regimes)
         print("\nBacktest (causal, no lookahead):")
         backtest_regime_strategy(prices, wf_features, wf_regimes, avoid_regime=0)
