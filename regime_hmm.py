@@ -262,10 +262,10 @@ def plot_regimes(prices: pd.Series, regimes: pd.Series, n_states: int,
 def build_features(prices: pd.Series, vol_window: int = 10) -> pd.DataFrame:
     """From a price series, build the (return, volatility) feature matrix
     the HMM will be fit on."""
-    df = pd.DataFrame(index=prices.index)
-    df["return"] = prices.pct_change()
-    df["volatility"] = df["return"].rolling(vol_window).std()
-    df = df.dropna()
+    df = pd.DataFrame(index=prices.index) #empty box
+    df["return"] = prices.pct_change() #today-yesterday/yesterday
+    df["volatility"] = df["return"].rolling(vol_window).std() #rolling 10 day std deviation of results
+    df = df.dropna() #dropping first 9 rows since they have NA under volatility
     return df
 
 

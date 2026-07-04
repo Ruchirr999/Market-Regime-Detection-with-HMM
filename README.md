@@ -33,6 +33,10 @@ helped a simple trading strategy beat buy-and-hold.
    which regime it's currently in and how long it's persisted.
 8. **Saves annotated plots** of the full history, three random months
    zoomed in, and the latest week/month, all colored by detected regime.
+9. **Regime-conditioned position sizing** (`regime_sizing.py`) — replaces
+   the binary invested/cash signal with a continuous position size derived
+   from the HMM's posterior regime probabilities, so exposure scales
+   smoothly with model confidence instead of being a hard on/off switch.
 
 ## What's new in this version
 
@@ -85,24 +89,72 @@ titles, and only reported one all-time backtest number.
   a broken model into `predict()`. This fixes a `ValueError: startprob_
   must sum to 1 (got nan)` crash that could occur on tickers with limited
   history or flat price periods.
+- **Regime-conditioned position sizing** (`regime_sizing.py`) — a
+  companion module that replaces the binary invested/cash signal with a
+  continuous exposure level driven by the HMM's full posterior probability
+  vector. Key additions:
+  - `walk_forward_proba()` — same causal walk-forward logic as
+    `walk_forward_regimes()` but returns a per-day DataFrame of
+    `P(regime_i | data up to t)` for all regimes instead of a single hard
+    label, preserving the model's uncertainty rather than discarding it.
+  - `regime_weights()` — maps regime index to a `[0, 1]` weight using one
+    of three shapes: `linear` (equal steps), `convex` (risk-averse, stays
+    low until clearly in a good regime), or `concave` (aggressive, ramps
+    up exposure quickly). Choice reflects your risk appetite.
+  - `compute_position_size()` — dots today's probability vector with the
+    weight vector to produce a scalar position in `[min_position,
+    max_position]`. Also prints a **worst-regime exposure report** showing
+    how many days the model classified as regime 0, your average and
+    minimum exposure on those days, and confirming you were never below
+    your `min_position` floor.
+  - `backtest_sized_strategy()` — compares buy & hold, the original
+    binary switch, and the new sized strategy side by side with total
+    return, Sharpe, and average position for each.
+  - `plot_position_size()` — three-panel plot: cumulative equity curves
+    for all three strategies, daily position size over time (sized vs
+    binary, with a dotted floor line showing your `min_position`), and a
+    stacked probability chart showing how regime uncertainty evolved.
+  - **Interactive `min_position` input** at startup — prompts you to set
+    a floor (e.g. `0.2` = always at least 20% invested even in the worst
+    regime), validates the input, and clearly explains what it means.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `regime_hmm.py` | Core HMM pipeline — data download, feature engineering, model selection, walk-forward fit, backtesting, plots, verdict |
+| `regime_sizing.py` | Companion module — probability-based position sizing, worst-regime exposure report, three-strategy comparison |
 
 ## Usage
 
+**Core pipeline:**
 ```bash
-python market_regime.py
+python regime_hmm.py
 # Enter stock name (or 'NSEI' for Nifty index): RELIANCE
+```
+
+**Position sizing:**
+```bash
+python regime_sizing.py
+# Enter stock (or NSEI for Nifty): TCS
+# Weight shape [linear/convex/concave] (default: linear): linear
+# Minimum position floor: 0.2
 ```
 
 Or from another script:
 
 ```python
-from market_regime import run
+from regime_hmm import run
 run("RELIANCE")          # uses yfinance
 run("NSEI")               # Nifty 50 index
 run("MYTICKER", data_loader=my_price_loader)  # custom price source
+
+from regime_sizing import run_sized
+run_sized("TCS", shape="linear", min_position=0.2)
 ```
 
-Outputs appear under `outputs/<LABEL>/`.
+Outputs appear under `outputs/<LABEL>/`, including a new
+`<TICKER>_sized_position.png` plot from `regime_sizing.py`.
 
 ## Known limitations / caveats (carried over and worth restating)
 
@@ -131,8 +183,13 @@ Outputs appear under `outputs/<LABEL>/`.
 - **More features** beyond return/volatility (e.g. volume, RSI, moving-average
   crossovers) to help the HMM separate regimes that look similar in
   return/vol space alone.
-- **Regime-conditional position sizing** instead of a binary invested/cash
-  switch (e.g. scale exposure down rather than fully exiting).
+- ~~**Regime-conditional position sizing**~~ ✅ Done — see `regime_sizing.py`.
+- **Regime transition detection** — knowing you just *entered* regime 0 is
+  more actionable than knowing you've been in it for 3 weeks. The next
+  step is a transition detector in `regime_monitor.py` that fires only
+  when a genuine regime change is confirmed (e.g. `P(new_regime) > 0.7`
+  held for at least N consecutive days), suppressing single-day flickers
+  that don't warrant action.
 - **Statistical significance testing** on the monthly breakdown (e.g. a
   paired t-test or bootstrap on `difference_%`) rather than eyeballing the
   win-rate and mean/std.
