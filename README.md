@@ -1,211 +1,234 @@
-# Market Regime Detection with Hidden Markov Models
+# Market Regime Detection using Hidden Markov Models
 
-Detects hidden "market regimes" (e.g. calm uptrend, high-vol selloff,
-sideways chop) in a stock or index's price history using a Gaussian Hidden
-Markov Model, then checks whether knowing the regime would have actually
-helped a simple trading strategy beat buy-and-hold.
+Unsupervised detection of hidden market regimes (bull, bear, choppy, crash) from daily price data using Gaussian HMMs, applied to NSE-listed Indian equities. Includes a walk-forward causal backtest, position sizing, noise filtering, and cross-ticker evaluation — built as an ML portfolio project.
 
-## What it does
+> **Honest framing:** this is not a trading system. It is a demonstration that statistically distinct market regimes exist and carry measurable signal. Whether that signal translates to return outperformance depends heavily on the stock's behavior.
 
-1. **Downloads price history** for a ticker (NSE stocks by default, or the
-   Nifty 50 index) via `yfinance`, starting from 2015.
-2. **Builds features**: daily return and a 10-day rolling volatility.
-3. **Picks the number of regimes (k)** automatically by fitting Gaussian
-   HMMs for k = 2..4 and selecting the one with the lowest BIC (Bayesian
-   Information Criterion), which balances fit quality against model
-   complexity instead of guessing a fixed number of states.
-4. **Labels each regime** by its historical mean return, so state 0 is
-   always "worst" and state k-1 is always "best" — this makes the labels
-   comparable across tickers and across refits.
-5. **Fits two versions of the model**:
-   - **Global fit** — trained once on the *entire* history. Useful as a
-     sanity check but has lookahead bias: it "knows" about crashes and
-     rallies before they happen, so its backtest result is inflated.
-   - **Walk-forward fit** — refit every 21 trading days on an expanding
-     window of only *past* data, and each day's regime is decoded using
-     only data up to that day. This is the causal, honest version — no
-     information from the future leaks into a regime label.
-6. **Backtests a toy strategy**: stay invested unless the walk-forward
-   model says you're in the worst regime, in which case go to cash.
-   Compared against plain buy-and-hold, both in total and broken down
-   **month by month**.
-7. **Evaluates across multiple tickers** (`evaluate_regimes.py`) — runs
-   the full walk-forward pipeline on a list of stocks, computes a full
-   suite of metrics for each, and produces a cross-ticker summary table
-   and comparison charts. This is what turns the project from a demo into
-   a study.
-8. **Produces a bullish/bearish verdict** for the most recent day, based on
-   which regime it's currently in and how long it's persisted.
-9. **Saves annotated plots** of the full history, three random months
-   zoomed in, and the latest week/month, all colored by detected regime.
-10. **Regime-conditioned position sizing** (`regime_sizing.py`) — replaces
-    the binary invested/cash signal with a continuous position size derived
-    from the HMM's posterior regime probabilities, so exposure scales
-    smoothly with model confidence instead of being a hard on/off switch.
+---
 
-## Files
+## Project Structure
 
-| File | Purpose |
-|---|---|
-| `regime_hmm.py` | Core HMM pipeline — data download, feature engineering, model selection, walk-forward fit, backtesting, plots, verdict |
-| `regime_sizing.py` | Companion module — probability-based position sizing, worst-regime exposure report, three-strategy comparison with full metrics |
-| `evaluate_regimes.py` | Evaluation module — multi-ticker backtest with Sharpe, Sortino, Calmar, Max Drawdown, CAGR, monthly win-rate; summary CSV and comparison charts |
+```
+.
+├── regime_hmm.py           # Core pipeline — start here
+├── evaluate_regimes.py     # Cross-ticker evaluation
+├── regime_sizing.py        # Continuous position sizing via regime probabilities
+├── regime_filters.py       # Persistence filter + severity score
+├── README.md
+└── outputs/
+    └── evaluation/
+        ├── summary.csv
+        └── plots/
+            ├── summary_comparison.png
+            ├── HDFCBANK_evaluation.png
+            ├── INFY_evaluation.png
+            ├── RELIANCE_evaluation.png
+            ├── SBIN_evaluation.png
+            ├── TATASTEEL_evaluation.png
+            └── TCS_evaluation.png
+```
 
-## Usage
+---
 
-**Core pipeline (single ticker):**
+## Files — What Each Does and When to Use It
+
+### `regime_hmm.py` — the core
+The brain of the project. Run this first on any ticker.
+
+**What it does:**
+- Downloads price data via yfinance (2015–present)
+- Builds 6 features from daily closes: return, slow volatility (21d), vol ratio (fast/slow — crash spike detector), drawdown (distance from 60d high), momentum (price vs 20d MA), vol-of-vol
+- Selects number of HMM states (2–4) using BIC — justified automatically, not guessed
+- Runs a **walk-forward causal fit**: refits HMM every 21 days on expanding window only (no lookahead). Also refits immediately when vol ratio > 2x (volatility spike = crash onset signal)
+- Labels every day with a regime (0 = worst, k-1 = best)
+- Backtests: avoid regime 0, hold cash; compare vs buy-and-hold
+- Outputs: regime plots, monthly breakdown CSV, report.txt, latest week/month zoom plots
+
+**When to use:** always — every other file depends on this.
+
 ```bash
 python regime_hmm.py
-# Enter stock name (or 'NSEI' for Nifty index): RELIANCE
+# prompts: Enter stock name (or 'NSEI' for Nifty index)
 ```
 
-**Multi-ticker evaluation:**
+**Outputs saved to** `outputs/<TICKER>/`
+
+---
+
+### `evaluate_regimes.py` — cross-ticker evaluation
+Run this after you have confidence in the core pipeline. Answers: "does this model work in general, or did it just get lucky on one stock?"
+
+**What it does:**
+- Runs the full walk-forward pipeline on a list of tickers
+- Computes 7 metrics for both buy-and-hold and regime strategy per ticker: Total Return, CAGR, Sharpe, Sortino, Max Drawdown, Calmar, Monthly Win Rate
+- Prints a summary table with sharpe edge, drawdown improvement, time in market
+- Saves `summary.csv` and a comparison bar chart
+
+**When to use:** when evaluating the model across multiple tickers, or before writing up results.
+
 ```bash
+# Interactive
 python evaluate_regimes.py
-# Press Enter for defaults (5 NSE + 5 US stocks), or type: RELIANCE,TCS,INFY
+
+# Non-interactive
+python evaluate_regimes.py --tickers RELIANCE HDFCBANK TATASTEEL TCS INFY SBIN
+
+# Skip plots for speed
+python evaluate_regimes.py --tickers RELIANCE HDFCBANK --no-plots
+
+# Custom output dir
+python evaluate_regimes.py --tickers TATASTEEL --output outputs/steel_test
 ```
 
-**Position sizing:**
+---
+
+### `regime_sizing.py` — continuous position sizing
+Upgrades the binary in/out signal to a continuous dial.
+
+**What it does:**
+- `walk_forward_proba()`: like the core walk-forward but returns full posterior probability vectors instead of hard labels — e.g. [0.7, 0.2, 0.1] instead of just "0"
+- `compute_position_size()`: converts probabilities to position size via dot product with regime weights. If 70% probability of worst regime → position ≈ 0.3 instead of 0
+- `backtest_sized_strategy()`: compares Buy & Hold vs Binary vs Sized with full metrics table
+- Three weight shapes: `linear` (default), `convex` (cautious), `concave` (aggressive)
+- `min_position` parameter: floor — never go below X% invested even in worst regime
+
+**When to use:** after the core pipeline, if you want smoother position changes instead of abrupt in/out switches.
+
 ```bash
 python regime_sizing.py
-# Enter stock (or NSEI for Nifty): TCS
-# Weight shape [linear/convex/concave] (default: linear): linear
-# Minimum position floor: 0.2
+# prompts: stock, weight shape, min_position floor
 ```
 
-Or from another script:
+---
 
-```python
-from regime_hmm import run
-run("RELIANCE")          # uses yfinance
-run("NSEI")              # Nifty 50 index
-run("MYTICKER", data_loader=my_price_loader)  # custom price source
+### `regime_filters.py` — noise cancellation + severity score
+Two additions to clean up noisy regime signals.
 
-from regime_sizing import run_sized
-run_sized("TCS", shape="linear", min_position=0.2)
+**What it does:**
 
-from evaluate_regimes import run_evaluation
-tickers = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "WIPRO",
-           "AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
-summary = run_evaluation(tickers, output_dir="outputs/evaluation")
+`apply_persistence_filter(regimes, min_days=3)`: only confirms a regime change after it has held for N consecutive days. Eliminates single-day flips that carry no real information. Tradeoff: reduces noise but adds up to N days of lag.
+
+`compare_filter_impact(prices, raw_regimes, [1,2,3,5])`: backtests with different `min_days` values so you can measure the noise-reduction vs lag tradeoff with actual numbers.
+
+`compute_severity_score(proba_df, features)`: collapses all signals into one 0–1 score per day. 0 = extremely bearish (worst regime, high confidence, deep drawdown, below MA). 1 = extremely bullish. Combines: regime probability (40%), model confidence (20%), drawdown (25%), momentum (15%).
+
+`compute_position_size_v2(severity, variant)`: position sizing from severity score instead of raw probabilities. Three variants: `conservative` (severity²), `moderate` (linear), `aggressive` (√severity).
+
+**When to use:** if your regime chart shows heavy flickering (regime changes every 1-2 days), run the persistence filter first. Use severity score if you want a single interpretable number per day instead of a probability vector.
+
+```bash
+python regime_filters.py
+# prompts: stock, min_position
 ```
 
-## Output structure
+---
 
+## Methodology
+
+### Features (6 total)
+| Feature | Window | What it captures |
+|---------|--------|-----------------|
+| `return` | daily | raw price change |
+| `vol_slow` | 21d rolling std | baseline volatility regime |
+| `vol_ratio` | fast(5d) / slow(21d) | volatility spike — fires 2-3 days before crash is visible in returns |
+| `drawdown` | distance from 60d high | separates "high vol crash" from "high vol recovery" |
+| `momentum` | price / 20d MA - 1 | trend direction — distinguishes low-vol uptrend from low-vol downtrend |
+| `vol_of_vol` | 10d std of vol_slow | regime stability — high = transitioning market |
+
+### Model Selection
+HMMs fitted for k=2 to 4 states. Best k selected by BIC (lower = better fit penalized for complexity). States relabeled 0..k-1 by mean return so labels are human-interpretable and comparable across tickers.
+
+### Walk-Forward (Causal, No Lookahead)
+- Train on expanding window of past data only
+- Refit every 21 trading days (normal schedule)
+- **Adaptive refit:** immediately when `vol_ratio > 2.0` — crash onset detection
+- Validate every fit before accepting (checks for NaN parameters)
+- First `min_train=252` days held out as initial training window
+
+### Backtest
+Binary strategy: fully invested unless in regime 0 (worst), then hold cash. 1-day signal lag (yesterday's regime → today's position). No transaction costs modeled.
+
+---
+
+## Results
+
+Evaluated on 6 NSE-listed tickers, 2015–2026 (~2312 trading days each), walk-forward causal backtest.
+
+| Ticker | Type | BH Sharpe | Strat Sharpe | Sharpe Edge | BH MaxDD | Strat MaxDD | DD Improved | Time in Market |
+|--------|------|-----------|--------------|-------------|----------|-------------|-------------|----------------|
+| RELIANCE | Conglomerate | 0.77 | 0.67 | -0.09 | -45.1% | -45.1% | 0.0pp | 81.0% |
+| HDFCBANK | Private Bank | 0.55 | 0.82 | **+0.28** | -41.1% | -20.8% | **+20.3pp** | 84.6% |
+| INFY | IT Large Cap | 0.54 | 0.41 | -0.13 | -48.2% | -44.2% | +3.96pp | 94.4% |
+| TCS | IT Large Cap | 0.46 | 0.43 | -0.03 | -53.4% | -37.7% | +15.7pp | 91.0% |
+| TATASTEEL | Cyclical | 0.70 | **0.80** | **+0.10** | -64.5% | -50.2% | **+14.3pp** | 83.2% |
+| SBIN | PSU Bank | 0.65 | 0.53 | -0.12 | -59.5% | -46.4% | +13.1pp | 81.4% |
+
+### Key Findings
+
+**Sharpe improvement: 2/6 tickers (HDFCBANK, TATASTEEL)**
+Both are stocks with genuine volatility clustering and mean-reverting behavior — the HMM's regime labels carry real signal here. HDFCBANK showed the strongest result: Sharpe 0.55 → 0.82 with max drawdown nearly halved (41% → 21%).
+
+**Drawdown reduction: 5/6 tickers**
+The strategy consistently reduces worst-case loss even when it underperforms on total return. TCS: 53% → 38%. SBIN: 59% → 46%. The one exception is RELIANCE where the strategy adds no value at all.
+
+**Where the strategy fails: smooth trending large caps**
+RELIANCE, INFY, TCS, SBIN — all show the same pattern. The regime chart flickers heavily (regime changes every 1-2 days), the strategy churns in and out, and misses sustained uptrends. The HMM detects real statistical regimes but those regimes don't map cleanly to down/up periods on these stocks.
+
+**Honest conclusion:** the regime detection signal exists and is statistically real. It translates to return outperformance only on stocks with genuine boom/bust cycle structure (cyclicals, volatile financials). On smooth large-cap trending stocks it adds drawdown protection at the cost of return — a tradeoff, not a failure, but worth stating plainly.
+
+---
+
+## Limitations
+
+- **No transaction costs:** every regime switch assumes costless execution. In reality, frequent switching on noisy tickers (SBIN, RELIANCE) would erode returns further.
+- **Gaussian emission assumption:** HMM assumes returns within each regime are normally distributed. Crash regimes have fat tails — the model underestimates extreme event probability.
+- **Fixed feature weights in severity score:** the 40/20/25/15 weights in `compute_severity_score` are judgment calls, not statistically optimized. Optimizing them on historical data risks overfitting.
+- **Persistence filter lag:** `apply_persistence_filter` with `min_days=3` means you're always 3 days late confirming a new regime. On a COVID-speed crash this matters.
+- **Single binary strategy:** the backtest only tests "avoid regime 0." The sizing layer (`regime_sizing.py`) is a better approach but its results aren't included in the cross-ticker eval above.
+- **Data from 2015:** misses the 2008-2013 period which would include more crash regimes for training.
+
+---
+
+## Installation
+
+```bash
+pip install yfinance hmmlearn pandas numpy matplotlib scikit-learn
 ```
-outputs/
-  <TICKER>/                        <- single-ticker run (regime_hmm.py)
-    report.txt
-    monthly_breakdown.csv
-    plots/
-      <TICKER>_regimes_lookahead.png
-      <TICKER>_regimes_walkforward.png
-      <TICKER>_regimes_monthly_zoom.png
-      <TICKER>_regimes_latest_week.png
-      <TICKER>_regimes_latest_month.png
-      <TICKER>_sized_position.png  <- from regime_sizing.py
 
-  evaluation/                      <- multi-ticker run (evaluate_regimes.py)
-    summary.csv
-    plots/
-      <TICKER>_evaluation.png      <- hero chart per ticker
-      summary_comparison.png       <- cross-ticker Sharpe + drawdown bar chart
+Python 3.9+ required. Tested on macOS (M4) and Linux.
+
+---
+
+## Quick Start
+
+```bash
+# Run on a single stock
+python regime_hmm.py
+# > Enter stock name: TATASTEEL
+
+# Evaluate across multiple tickers
+python evaluate_regimes.py --tickers HDFCBANK TATASTEEL TCS
+
+# Add continuous position sizing
+python regime_sizing.py
+# > Enter stock: HDFCBANK
+# > Weight shape: linear
+# > Min position: 0.1
+
+# Apply persistence filter to reduce noise
+python regime_filters.py
+# > Enter stock: SBIN
 ```
 
-## Evaluation metrics (Part 1)
+---
 
-`evaluate_regimes.py` answers the question *"does my model actually work?"*
-with the following metrics, computed for both buy-and-hold and the regime
-strategy, on every ticker:
+## Which File to Use When
 
-| Metric | What it tells you |
-|---|---|
-| **Total Return %** | Raw compounded return over the full history |
-| **CAGR %** | Annualised return — comparable across tickers with different history lengths |
-| **Sharpe** | Return per unit of total volatility — the standard risk-adjusted measure |
-| **Sortino** | Like Sharpe but only penalises downside volatility — fairer to strategies that cut losses |
-| **Calmar** | CAGR divided by worst drawdown — measures return per unit of worst-case pain |
-| **Max Drawdown %** | Worst peak-to-trough loss — the number that tells you how bad it can get |
-| **Monthly Win %** | Fraction of calendar months with a positive return |
-| **% Time in Market** | How often the strategy was invested (vs sitting in cash) |
-
-**Sharpe edge** (strategy Sharpe minus buy-and-hold Sharpe) and **Max DD
-improvement** (how many percentage points less severe the strategy's worst
-drawdown was) are highlighted per ticker and aggregated at the end.
-
-The cross-ticker summary is what you'd cite in a writeup: *"the regime
-strategy improved Sharpe on 8/10 tickers and reduced max drawdown on 9/10,
-with an average Sharpe edge of +0.18."* That is a falsifiable, honest claim
-about whether the model carries signal — which is what separates this from
-a demo.
-
-`regime_sizing.py` now prints the same full metrics table (Total Return,
-CAGR, Sharpe, Sortino, Calmar, Max Drawdown, Monthly Win %, Avg Position)
-for all three strategies (Buy & Hold, Binary, Sized), with `*` marking
-where the strategy beats buy-and-hold, and explicit Sharpe edge and
-drawdown improvement callouts.
-
-## What's new in this version
-
-### evaluate_regimes.py (new)
-- Runs the full walk-forward pipeline on any list of tickers and collects
-  a full suite of metrics for each: Total Return, CAGR, Sharpe, Sortino,
-  Calmar, Max Drawdown, Monthly Win Rate, % time in market.
-- Computes **Sharpe edge** and **Max Drawdown improvement** per ticker so
-  you can see at a glance where the model adds value and where it doesn't.
-- Prints aggregate stats across all tickers: how many it beat on Sharpe,
-  how many it reduced drawdown on, average edge.
-- Saves `summary.csv` and two charts: a **hero chart** per ticker
-  (regime-colored price bands + equity curves) and a **cross-ticker
-  comparison bar chart** (Sharpe and drawdown side by side).
-- Tickers that fail (too little history, bad symbol, download error) are
-  skipped cleanly with a printed reason — the rest still run.
-
-### regime_sizing.py (updated)
-- `backtest_sized_strategy()` now prints a **full formatted metrics table**
-  for all three strategies instead of just three summary lines. Includes
-  Total Return, CAGR, Sharpe, Sortino, Calmar, Max Drawdown, Monthly Win %,
-  and Avg Position, with `*` markers where the strategy beats buy-and-hold.
-
-### regime_hmm.py (previous version, carried forward)
-- Month-by-month backtest breakdown saved to `monthly_breakdown.csv`
-- Full console transcript captured to `report.txt` via `Tee`
-- Organized output under `outputs/<TICKER>/`
-- Clearer plot titles, axis labels, legends
-- Robust walk-forward fitting with NaN validation
-- Testable `data_loader` injection in `run()`
-
-## Known limitations / honest caveats
-
-- **`resolve_ticker` assumes NSE by default.** A plain ticker like `AAPL`
-  gets turned into `AAPL.NS` first, then retried as `AAPL` if that fails.
-  This covers most cases but explicit suffixes (`.BO`, `.L`, etc.) are not
-  handled — extend `resolve_ticker` if you need other exchanges.
-- **The bullish/bearish thresholds in `classify_bullish_bearish`** are
-  rough judgment calls (±7%, ±20% annualized), not statistically derived.
-- **Monthly Sharpe ratios are noisy.** Each calendar month has only ~21
-  daily return observations, so monthly Sharpe should be read as a rough
-  directional signal, not a precise estimate — the report says this explicitly.
-- **The backtest strategy is intentionally simple** — fully invested or
-  fully in cash, no transaction costs, no slippage. It exists to test
-  whether regime labels carry *any* signal, not as a deployable strategy.
-- **This is not investment advice.**
-
-## Possible future improvements
-
-- **Transaction costs & slippage** in the backtest.
-- **More features** beyond return/volatility (e.g. volume, RSI,
-  moving-average crossovers).
-- ~~**Regime-conditional position sizing**~~ ✅ Done — see `regime_sizing.py`.
-- ~~**Multi-ticker evaluation with proper metrics**~~ ✅ Done — see `evaluate_regimes.py`.
-- **Statistical significance testing** on the monthly breakdown (e.g.
-  bootstrap confidence intervals on `difference_%`) rather than eyeballing
-  win-rate and mean/std.
-- **Regime transition detector** — a `regime_monitor.py` that fires only
-  when a genuine regime change is confirmed (`P(new_regime) > 0.7` held
-  for N consecutive days), suppressing single-day flickers.
-- **Parallelise `walk_forward_regimes`** — refits at different `t` cutoffs
-  are independent and could run concurrently.
-- **Config file / CLI args** for `vol_window`, `min_train`, `refit_every`,
-  `max_states`, and `avoid_regime`.
-- **Unit tests** for pure functions using synthetic price series.
+| Goal | File |
+|------|------|
+| Understand regimes for one stock | `regime_hmm_v2.py` |
+| Compare model across many stocks | `evaluate_regimes.py` |
+| Smoother position sizing | `regime_sizing.py` |
+| Regime chart is too flickery | `regime_filters.py` → `apply_persistence_filter` |
+| Want one number per day ("how bearish?") | `regime_filters.py` → `compute_severity_score` |
+| Build on top of this pipeline | Import from `regime_hmm.py` — all functions are modular |
