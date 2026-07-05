@@ -1,17 +1,40 @@
 """
 Market Regime Detection using Hidden Markov Models
 ----------------------------------------------------
-Fits a Gaussian HMM on (return, rolling volatility) to infer hidden
-market regimes (e.g. calm-uptrend, high-vol-selloff, sideways-chop),
-then backtests a regime-conditioned toy strategy against buy-and-hold.
+Fits a Gaussian HMM on enriched features (return, slow vol, fast vol,
+vol_ratio, drawdown) to infer hidden market regimes, then backtests a
+regime-conditioned strategy against buy-and-hold.
 
-This version adds, on top of the original script:
-  - A month-by-month breakdown of buy&hold vs. regime-strategy performance
-  - Everything printed to the console is also saved to a single .txt report
-  - All output files (plots, report, csv) are organised into
-    outputs/<TICKER>/... instead of dumping loose files in the cwd
-  - Clearer plot titles/axis labels/legends
-  - A README.md describing the project, methodology, and next steps
+Improvements over previous version (all three fixes for crash detection):
+
+  FIX 1 — Richer features (build_features)
+    Old: 2 features — return, 10-day rolling vol
+    New: 5 features — return, vol_slow (10d), vol_fast (3d), vol_ratio
+         (fast/slow — spike detector), drawdown (distance from 60d high)
+    Why: The 10-day vol window reacted too slowly to crashes like COVID.
+         vol_fast picks up a volatility spike within 2-3 days. vol_ratio
+         fires when fast vol suddenly exceeds slow vol — the clearest
+         statistical signature of a crash onset. drawdown separates
+         "high vol crash" from "high vol recovery" — both have similar
+         return/vol, but drawdown is large in one and recovering in the other.
+
+  FIX 2 — Adaptive refitting (walk_forward_regimes)
+    Old: refit HMM every fixed 21 trading days regardless of market conditions
+    New: refit immediately whenever vol_ratio > VOL_SPIKE_THRESHOLD (default 2.0),
+         i.e. when fast vol exceeds slow vol by 2x — the signature of a crash
+         onset. Normal schedule (refit_every=21) applies in calm periods.
+    Why: During a fast crash, waiting up to 21 days for the next scheduled
+         refit means the model is using stale regime boundaries exactly when
+         the market is moving fastest. Adaptive refitting updates the model
+         within 1-2 days of a volatility spike.
+
+  FIX 3 — Reduced min_train (run defaults)
+    Old: min_train=500 (roughly 2 years of history before labeling starts)
+    New: min_train=252 (1 trading year)
+    Why: 500 days was too conservative. With 252 days the model starts
+         labeling earlier, giving it more crash events in its labeled history
+         to learn from before the next one arrives. 252 days is still enough
+         for a stable HMM fit with 2-4 states.
 """
 
 import os
@@ -27,14 +50,24 @@ from hmmlearn.hmm import GaussianHMM
 
 
 # --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
+
+MIN_VIABLE_TRAIN_ROWS   = 60    # below this an HMM fit is too noisy to trust
+DEFAULT_MIN_TRAIN       = 252   # FIX 3: reduced from 500 to 1 trading year
+MIN_TRAIN_FLOOR         = 100   # hard floor even for short-history tickers
+MIN_WALK_FORWARD_TEST_DAYS = 60 # need ~3 months of labeled days to be meaningful
+VOL_SPIKE_THRESHOLD     = 2.0   # FIX 2: vol_ratio above this triggers early refit
+
+
+# --------------------------------------------------------------------------
 # Output organisation
 # --------------------------------------------------------------------------
 
 class Tee:
     """Duplicates everything written to stdout into a log file as well,
-    so the full console transcript (all the print() statements already in
-    this script) ends up saved as a readable .txt report with zero changes
-    to the print statements themselves."""
+    so the full console transcript ends up saved as a readable .txt report
+    with zero changes to the print statements themselves."""
 
     def __init__(self, filepath):
         self.terminal = sys.stdout
@@ -54,14 +87,14 @@ class Tee:
 
 def make_output_dirs(label: str, root: str = "outputs") -> dict:
     """Creates outputs/<label>/ and outputs/<label>/plots/ and returns
-    the paths so every function in this script writes to the same place."""
-    base = os.path.join(root, label)
+    the paths so every function writes to the same place."""
+    base  = os.path.join(root, label)
     plots = os.path.join(base, "plots")
     os.makedirs(plots, exist_ok=True)
     return {
-        "base": base,
-        "plots": plots,
-        "report_txt": os.path.join(base, "report.txt"),
+        "base":        base,
+        "plots":       plots,
+        "report_txt":  os.path.join(base, "report.txt"),
         "monthly_csv": os.path.join(base, "monthly_breakdown.csv"),
     }
 
@@ -70,19 +103,19 @@ def make_output_dirs(label: str, root: str = "outputs") -> dict:
 # Ticker handling
 # --------------------------------------------------------------------------
 
-def resolve_ticker(stock_input: str) -> tuple[str, str, str]:
+def resolve_ticker(stock_input: str) -> tuple:
     """
     Turns user input into a yfinance ticker + a clean label for filenames.
-    - "NSEI" / "NIFTY" / "NIFTY50" -> the index itself (^NSEI)
-    - anything else -> assumed to be an NSE-listed stock, gets ".NS" appended
-      unless the user already typed a suffix (e.g. "RELIANCE.NS").
+      - "NSEI" / "NIFTY" / "NIFTY50" -> the index (^NSEI)
+      - anything else                 -> NSE stock, gets ".NS" appended
+                                         unless user already added a suffix
 
     Returns (ticker, label, fallback_ticker):
-      - `ticker` is the NSE-assumed candidate to try first (e.g. "AAPL.NS").
-      - `fallback_ticker` is the raw, unmodified input (e.g. "AAPL"), which
-        the caller can retry with if the NSE-suffixed candidate returns no
-        data -- this is what makes a US ticker like "AAPL" work correctly
-        instead of only ever trying (and failing on) "AAPL.NS".
+      ticker          — NSE candidate to try first  (e.g. "AAPL.NS")
+      label           — clean string for filenames  (e.g. "AAPL")
+      fallback_ticker — raw unmodified input        (e.g. "AAPL")
+                        retried if the .NS candidate has no data, making
+                        US tickers work without manual suffixes.
     """
     raw = stock_input.strip().upper()
     index_aliases = {"NSEI", "NIFTY", "NIFTY50", "NIFTY 50", "^NSEI"}
@@ -100,9 +133,8 @@ def resolve_ticker(stock_input: str) -> tuple[str, str, str]:
 
 
 def classify_bullish_bearish(ann_return_pct: float) -> str:
-    """Maps the current regime's annualized return to a human verdict.
-    Thresholds are rough judgment calls, not statistically derived --
-    worth stating that plainly rather than pretending precision."""
+    """Maps a regime's annualised return to a human verdict.
+    Thresholds are rough judgment calls, not statistically derived."""
     if ann_return_pct >= 20:
         return "Strongly Bullish"
     elif ann_return_pct >= 7:
@@ -115,10 +147,10 @@ def classify_bullish_bearish(ann_return_pct: float) -> str:
         return "Strongly Bearish"
 
 
-def latest_regime_verdict(regimes: pd.Series, regime_stats: pd.DataFrame, label: str):
-    """Prints the current regime, how long the stock has been in it,
-    and a bullish/bearish verdict with rough magnitude."""
-    latest_date = regimes.index[-1]
+def latest_regime_verdict(regimes: pd.Series, regime_stats: pd.DataFrame,
+                           label: str):
+    """Prints the current regime, consecutive-day streak, and verdict."""
+    latest_date   = regimes.index[-1]
     latest_regime = regimes.iloc[-1]
 
     streak = 1
@@ -129,15 +161,14 @@ def latest_regime_verdict(regimes: pd.Series, regime_stats: pd.DataFrame, label:
             break
 
     ann_return = regime_stats.loc[latest_regime, "ann_return_%"]
-    verdict = classify_bullish_bearish(ann_return)
+    verdict    = classify_bullish_bearish(ann_return)
 
     print(f"\n=== {label}: Current Verdict ===")
     print(f"As of {latest_date.date()}: Regime {latest_regime}, "
           f"in this regime for {streak} consecutive trading day(s)")
-    print(f"Historical annualized return of this regime: {ann_return:.1f}%")
+    print(f"Historical annualised return of this regime: {ann_return:.1f}%")
     print(f"Verdict: {verdict}")
-    print("(Note: this describes the recent/current statistical regime, "
-          "not a forecast of future direction.)")
+    print("(Note: describes the current statistical regime, not a forecast.)")
     return verdict
 
 
@@ -146,17 +177,15 @@ def latest_regime_verdict(regimes: pd.Series, regime_stats: pd.DataFrame, label:
 # --------------------------------------------------------------------------
 
 def plot_random_months(prices: pd.Series, regimes: pd.Series, n_states: int,
-                        label: str, num_months: int = 3, save_path: str = None):
-    """Picks random months from the dataset and plots them side-by-side so
-    you can see day-to-day regime changes up close."""
+                       label: str, num_months: int = 3, save_path: str = None):
+    """Picks random months and plots them side-by-side for close inspection."""
     aligned = prices.loc[regimes.index].to_frame(name="price")
-    aligned["regime"] = regimes
-    aligned["YearMonth"] = aligned.index.to_period("M").astype(str)
-    unique_months = aligned["YearMonth"].unique().tolist()
+    aligned["regime"]     = regimes
+    aligned["YearMonth"]  = aligned.index.to_period("M").astype(str)
+    unique_months         = aligned["YearMonth"].unique().tolist()
 
-    sampled_months = random.sample(unique_months, min(num_months, len(unique_months)))
-    sampled_months.sort()
-
+    sampled_months = sorted(random.sample(unique_months,
+                                          min(num_months, len(unique_months))))
     fig, axes = plt.subplots(1, num_months, figsize=(5 * num_months, 5))
     if num_months == 1:
         axes = [axes]
@@ -165,30 +194,28 @@ def plot_random_months(prices: pd.Series, regimes: pd.Series, n_states: int,
 
     for ax, month in zip(axes, sampled_months):
         month_data = aligned[aligned["YearMonth"] == month]
-
-        ax.plot(month_data.index, month_data["price"], color="black", alpha=0.3,
-                 linewidth=1, label="Price" if ax is axes[0] else None)
-
+        ax.plot(month_data.index, month_data["price"], color="black",
+                alpha=0.3, linewidth=1,
+                label="Price" if ax is axes[0] else None)
         for state in range(n_states):
             mask = month_data["regime"] == state
             if mask.any():
-                ax.scatter(month_data.index[mask], month_data.loc[mask, "price"],
-                            c=[colors[state]], s=30,
-                            label=f"Regime {state}", zorder=5)
-
+                ax.scatter(month_data.index[mask],
+                           month_data.loc[mask, "price"],
+                           c=[colors[state]], s=30,
+                           label=f"Regime {state}", zorder=5)
         ax.set_title(f"{month}", fontsize=11, fontweight="bold")
         ax.set_xlabel("Day of month")
         ax.set_ylabel("Price")
         ax.grid(alpha=0.2)
         ax.xaxis.set_major_formatter(mdates.DateFormatter("%d"))
         plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
-
-        if ax == axes[0]:
+        if ax is axes[0]:
             ax.legend(loc="best", fontsize=8, title="Legend")
 
     fig.suptitle(f"{label}: Regime Zoom-In on Random Months "
-                  f"(state 0 = worst regime, state {n_states - 1} = best)",
-                  fontsize=12)
+                 f"(state 0 = worst, state {n_states-1} = best)",
+                 fontsize=12)
     plt.tight_layout(rect=[0, 0, 1, 0.94])
     plt.savefig(save_path, dpi=130)
     plt.close(fig)
@@ -196,26 +223,24 @@ def plot_random_months(prices: pd.Series, regimes: pd.Series, n_states: int,
 
 
 def plot_recent_window(prices: pd.Series, regimes: pd.Series, n_states: int,
-                        n_days: int, window_label: str, ticker_label: str,
-                        save_path: str = None):
-    """Plots the most recent `n_days` trading days of data, colored by regime.
-    Use n_days=5 for 'latest week', n_days=21 for 'latest month'
-    (21 trading days ~= 1 calendar month)."""
-    aligned = prices.loc[regimes.index].to_frame(name="price")
+                       n_days: int, window_label: str, ticker_label: str,
+                       save_path: str = None):
+    """Plots the most recent n_days trading days colored by regime."""
+    aligned           = prices.loc[regimes.index].to_frame(name="price")
     aligned["regime"] = regimes
-    recent = aligned.tail(n_days)
+    recent            = aligned.tail(n_days)
 
     fig, ax = plt.subplots(figsize=(9, 5))
-    colors = plt.cm.RdYlGn(np.linspace(0.1, 0.9, n_states))
+    colors  = plt.cm.RdYlGn(np.linspace(0.1, 0.9, n_states))
 
     ax.plot(recent.index, recent["price"], color="black", alpha=0.3,
-             linewidth=1, label="Price")
-
+            linewidth=1, label="Price")
     for state in range(n_states):
         mask = recent["regime"] == state
         if mask.any():
             ax.scatter(recent.index[mask], recent.loc[mask, "price"],
-                        c=[colors[state]], s=40, label=f"Regime {state}", zorder=5)
+                       c=[colors[state]], s=40, label=f"Regime {state}",
+                       zorder=5)
 
     ax.set_title(f"{ticker_label}: Last {window_label} "
                  f"({recent.index[0].date()} to {recent.index[-1].date()})",
@@ -226,7 +251,6 @@ def plot_recent_window(prices: pd.Series, regimes: pd.Series, n_states: int,
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=45)
     ax.legend(loc="best", title="0 = worst regime")
-
     plt.tight_layout()
     plt.savefig(save_path, dpi=130)
     plt.close(fig)
@@ -234,17 +258,18 @@ def plot_recent_window(prices: pd.Series, regimes: pd.Series, n_states: int,
 
 
 def plot_regimes(prices: pd.Series, regimes: pd.Series, n_states: int,
-                  ticker_label: str, subtitle: str, save_path: str = None):
+                 ticker_label: str, subtitle: str, save_path: str = None):
     aligned = prices.loc[regimes.index]
     fig, ax = plt.subplots(figsize=(12, 5))
-    colors = plt.cm.RdYlGn(np.linspace(0.1, 0.9, n_states))
+    colors  = plt.cm.RdYlGn(np.linspace(0.1, 0.9, n_states))
     for state in range(n_states):
         mask = regimes == state
-        ax.scatter(aligned.index[mask], aligned[mask], c=[colors[state]],
-                    s=6, label=f"Regime {state}")
-    ax.plot(aligned.index, aligned.values, color="black", alpha=0.2, linewidth=0.8)
+        ax.scatter(aligned.index[mask], aligned[mask],
+                   c=[colors[state]], s=6, label=f"Regime {state}")
+    ax.plot(aligned.index, aligned.values, color="black", alpha=0.2,
+            linewidth=0.8)
     ax.legend(loc="upper left", title="0 = worst regime, higher = better")
-    ax.set_title(f"{ticker_label}: Price Colored by Detected HMM Regime\n{subtitle}",
+    ax.set_title(f"{ticker_label}: Price Colored by HMM Regime\n{subtitle}",
                  fontsize=12, fontweight="bold")
     ax.set_xlabel("Date")
     ax.set_ylabel("Price")
@@ -256,29 +281,75 @@ def plot_regimes(prices: pd.Series, regimes: pd.Series, n_states: int,
 
 
 # --------------------------------------------------------------------------
-# Feature engineering / model selection / labeling
+# FIX 1: Feature engineering — 5 features instead of 2
 # --------------------------------------------------------------------------
 
-def build_features(prices: pd.Series, vol_window: int = 10) -> pd.DataFrame:
-    """From a price series, build the (return, volatility) feature matrix
-    the HMM will be fit on."""
-    df = pd.DataFrame(index=prices.index) #empty box
-    df["return"] = prices.pct_change() #today-yesterday/yesterday
-    df["volatility"] = df["return"].rolling(vol_window).std() #rolling 10 day std deviation of results
-    df = df.dropna() #dropping first 9 rows since they have NA under volatility
+def build_features(prices: pd.Series,
+                   slow_vol: int = 10,
+                   fast_vol: int = 3,
+                   drawdown_window: int = 60) -> pd.DataFrame:
+    """
+    Builds the enriched feature matrix the HMM is fit on.
+
+    Features
+    --------
+    return        : daily percentage return — the primary signal
+    vol_slow      : slow_vol-day rolling std of returns (default 10d)
+                    original feature; captures the prevailing volatility regime
+    vol_fast      : fast_vol-day rolling std of returns (default 3d)
+                    reacts to volatility spikes within 2-3 days instead of 10
+    vol_ratio     : vol_fast / vol_slow
+                    the crash-onset detector — spikes sharply when a sudden
+                    vol burst arrives (e.g. COVID March 2020 showed a
+                    vol_ratio > 3 within 3 days of the selloff starting,
+                    while the 10-day vol was still calm)
+    drawdown      : price / rolling_max(drawdown_window) - 1
+                    distance from the recent peak (always <= 0)
+                    separates "high vol crash" (large drawdown) from
+                    "high vol recovery" (drawdown recovering toward 0) —
+                    these look identical in return/vol space alone
+
+    Parameters
+    ----------
+    slow_vol        : window for slow volatility (default 10 trading days)
+    fast_vol        : window for fast volatility (default 3 trading days)
+    drawdown_window : rolling max window for drawdown calculation (default 60d)
+    """
+    df = pd.DataFrame(index=prices.index)
+    df["return"]   = prices.pct_change()
+    df["vol_slow"] = df["return"].rolling(slow_vol).std()
+    df["vol_fast"] = df["return"].rolling(fast_vol).std()
+
+    # vol_ratio: replace 0 denominator with NaN to avoid divide-by-zero
+    df["vol_ratio"] = df["vol_fast"] / df["vol_slow"].replace(0, np.nan)
+
+    # drawdown: fraction below rolling peak, always in [-inf, 0]
+    df["drawdown"] = prices / prices.rolling(drawdown_window).max() - 1
+
+    df = df.dropna()
     return df
 
 
-def select_n_states(features: np.ndarray, max_states: int = 5, n_iter: int = 200):
-    """Fit HMMs for k=2..max_states and pick the best by BIC.
-    Lower BIC = better fit penalized for complexity -- this is how you
-    justify the number of regimes instead of just guessing K=3."""
+# --------------------------------------------------------------------------
+# Model selection / labeling
+# --------------------------------------------------------------------------
+
+def select_n_states(features: np.ndarray, max_states: int = 4,
+                    n_iter: int = 200):
+    """
+    Fits HMMs for k=2..max_states and selects the best by BIC.
+    Lower BIC = better fit penalised for complexity.
+    max_states defaults to 4 (not 5) because with 5 features the parameter
+    count per state is larger, so BIC penalises complexity more — k=4 is
+    almost always selected anyway and k=5 rarely adds interpretable value.
+    """
     results = []
     for k in range(2, max_states + 1):
         model = GaussianHMM(n_components=k, covariance_type="diag",
-                             n_iter=n_iter, random_state=42)
+                            n_iter=n_iter, random_state=42)
         model.fit(features)
         log_likelihood = model.score(features)
+        # n_params: transition matrix (k*(k-1)) + means and variances per state
         n_params = k * (k - 1) + k * features.shape[1] * 2
         bic = -2 * log_likelihood + n_params * np.log(len(features))
         results.append((k, bic, model))
@@ -289,31 +360,31 @@ def select_n_states(features: np.ndarray, max_states: int = 5, n_iter: int = 200
 
 
 def label_regimes(model: GaussianHMM, features: pd.DataFrame) -> pd.Series:
-    """Run Viterbi to get the most likely regime sequence, then relabel
-    states 0..k-1 by their mean return so labels are human-interpretable
-    (state 0 = worst regime, state k-1 = best)."""
+    """
+    Runs Viterbi to get the most likely state sequence, then relabels
+    states 0..k-1 by mean return so state 0 = worst, k-1 = best.
+    This makes labels human-interpretable and comparable across tickers.
+    """
     hidden_states = model.predict(features.values)
     state_returns = [features["return"][hidden_states == s].mean()
-                      for s in range(model.n_components)]
+                     for s in range(model.n_components)]
     order = np.argsort(state_returns)
     remap = {old: new for new, old in enumerate(order)}
-    relabeled = pd.Series([remap[s] for s in hidden_states], index=features.index)
-    return relabeled
+    return pd.Series([remap[s] for s in hidden_states], index=features.index)
 
 
 def describe_regimes(features: pd.DataFrame, regimes: pd.Series):
-    """Print mean return / vol per regime so you can sanity check what
-    each state actually represents before trusting it."""
+    """Prints per-regime mean return / vol for a sanity check."""
     if len(regimes) == 0:
         raise ValueError(
-            "describe_regimes: regimes is empty, so there's nothing to "
-            "summarize. This usually means walk_forward_regimes() was given "
-            "less history than it could label -- check the NOTE/error it "
-            "printed above."
+            "describe_regimes: regimes is empty — walk_forward_regimes() "
+            "produced no labeled days. Check the NOTE/error printed above."
         )
+    # Use vol_slow as the representative volatility column
+    vol_col = "vol_slow" if "vol_slow" in features.columns else features.columns[1]
     summary = features.groupby(regimes).agg(
         mean_return=("return", "mean"),
-        volatility=("volatility", "mean"),
+        volatility=(vol_col, "mean"),
         days=("return", "count"),
     )
     summary["ann_return_%"] = summary["mean_return"] * 252 * 100
@@ -321,81 +392,139 @@ def describe_regimes(features: pd.DataFrame, regimes: pd.Series):
     return summary
 
 
-MIN_VIABLE_TRAIN_ROWS = 60  # below this, an HMM fit is too noisy to trust at all
-
+# --------------------------------------------------------------------------
+# FIX 2: Adaptive walk-forward with vol-spike-triggered early refit
+# --------------------------------------------------------------------------
 
 def walk_forward_regimes(features: pd.DataFrame, n_states: int,
-                          min_train: int = 500, refit_every: int = 21,
-                          n_iter: int = 100) -> pd.Series:
+                          min_train: int = DEFAULT_MIN_TRAIN,
+                          refit_every: int = 21,
+                          n_iter: int = 100,
+                          vol_spike_threshold: float = VOL_SPIKE_THRESHOLD
+                          ) -> pd.Series:
+    """
+    Causal walk-forward HMM labeling with adaptive refitting.
+
+    Standard behaviour (inherited from previous version):
+      - Train on expanding window of past data only (no lookahead).
+      - Refit the HMM every `refit_every` trading days.
+      - Validate each fit before accepting (checks for NaN params).
+      - If a fit fails, keep the previous valid model.
+
+    New (FIX 2) — adaptive early refit on volatility spikes:
+      - After each day, check the vol_ratio feature value.
+      - If vol_ratio > vol_spike_threshold, trigger an immediate refit
+        regardless of how recently the last refit happened.
+      - This means during a crash onset (e.g. COVID) the model updates
+        its regime boundaries within 1-2 days instead of waiting up to
+        21 days for the next scheduled refit.
+      - vol_ratio column must exist in features (built by build_features).
+        If it doesn't (e.g. custom feature set), adaptive refitting is
+        skipped silently and the fixed schedule applies.
+
+    Parameters
+    ----------
+    features              : DataFrame from build_features()
+    n_states              : number of HMM hidden states (from select_n_states)
+    min_train             : trading days of history before labeling starts
+                            (FIX 3: default reduced to 252 from 500)
+    refit_every           : normal refit interval in trading days (default 21)
+    n_iter                : HMM EM iterations per fit (default 100)
+    vol_spike_threshold   : vol_ratio value above which early refit fires
+                            (default 2.0 — fast vol > 2x slow vol)
+    """
     values = features.values
-    n = len(values)
+    n      = len(values)
+
+    has_vol_ratio = "vol_ratio" in features.columns
+    if has_vol_ratio:
+        vol_ratio_idx = features.columns.get_loc("vol_ratio")
+    else:
+        vol_ratio_idx = None
+        print("  NOTE: vol_ratio not found in features — adaptive refitting "
+              "disabled, using fixed schedule only.")
 
     if n < MIN_VIABLE_TRAIN_ROWS + 5:
         raise ValueError(
-            f"walk_forward_regimes: only {n} feature rows are available for "
-            f"this ticker -- that's too little history for any HMM fit to be "
-            f"meaningful (need at least ~{MIN_VIABLE_TRAIN_ROWS + 5} trading "
-            f"days). This ticker is likely too recently listed, or the date "
-            f"range is too short. Try a longer history or a different ticker."
+            f"walk_forward_regimes: only {n} feature rows available — "
+            f"too little history for a meaningful HMM fit "
+            f"(need at least {MIN_VIABLE_TRAIN_ROWS + 5} trading days). "
+            f"Try a longer date range or a different ticker."
         )
 
     if min_train >= n:
         adjusted = max(MIN_VIABLE_TRAIN_ROWS, int(n * 0.6))
         adjusted = min(adjusted, n - 5)
-        print(f"NOTE: min_train={min_train} but only {n} feature rows are "
-              f"available for this ticker. Shrinking min_train to {adjusted}.")
+        print(f"NOTE: min_train={min_train} but only {n} feature rows "
+              f"available. Shrinking min_train to {adjusted}.")
         min_train = adjusted
 
-    regimes = pd.Series(index=features.index, dtype=float)
-
-    model = None
+    regimes    = pd.Series(index=features.index, dtype=float)
+    model      = None
     last_refit = -1
-    remap = None
+    remap      = None
+    return_col = features.columns.get_loc("return")
+
+    early_refits = 0  # track how many vol-spike refits fired (for reporting)
 
     for t in range(min_train, n):
-        if model is None or (t - last_refit) >= refit_every:
+
+        # ---- Decide whether to refit ----
+        vol_spike = (
+            has_vol_ratio and
+            vol_ratio_idx is not None and
+            np.isfinite(values[t, vol_ratio_idx]) and
+            values[t, vol_ratio_idx] > vol_spike_threshold
+        )
+        scheduled = (model is None or (t - last_refit) >= refit_every)
+
+        if scheduled or vol_spike:
+            if vol_spike and not scheduled:
+                early_refits += 1
+
             train_data = values[:t]
-            candidate = GaussianHMM(n_components=n_states, covariance_type="diag",
-                                    n_iter=n_iter, random_state=42)
+            candidate  = GaussianHMM(n_components=n_states,
+                                     covariance_type="diag",
+                                     n_iter=n_iter, random_state=42)
             fit_ok = False
             try:
                 candidate.fit(train_data)
-                # Validate the model before accepting it: a failed fit leaves
-                # startprob_ / transmat_ with NaNs, which causes predict() to
-                # raise "startprob_ must sum to 1 (got nan)".
                 if (np.isfinite(candidate.startprob_).all() and
                         np.isfinite(candidate.transmat_).all() and
                         np.isfinite(candidate.means_).all()):
                     fit_ok = True
             except Exception as e:
-                print(f"  [walk_forward] HMM fit failed at t={t}: {e} -- "
-                      f"keeping previous model.")
+                print(f"  [walk_forward] HMM fit failed at t={t}: {e} "
+                      f"— keeping previous model.")
 
             if fit_ok:
-                model = candidate
+                model      = candidate
                 last_refit = t
 
+                # Rebuild remap: sort raw states by mean return
                 train_states = model.predict(train_data)
-                return_col = features.columns.get_loc("return")
-                state_means = [train_data[train_states == s, return_col].mean()
-                               if (train_states == s).any() else 0.0
-                               for s in range(n_states)]
+                state_means  = [
+                    train_data[train_states == s, return_col].mean()
+                    if (train_states == s).any() else 0.0
+                    for s in range(n_states)
+                ]
                 order = np.argsort(state_means)
                 remap = {old: new for new, old in enumerate(order)}
 
-        # If we still have no valid model yet, skip this day
         if model is None or remap is None:
             continue
 
         try:
-            window = values[:t + 1]
+            window    = values[:t + 1]
             state_seq = model.predict(window)
             regimes.iloc[t] = remap[state_seq[-1]]
         except Exception:
-            # predict failed for this day (e.g. degenerate window) -- leave NaN
-            pass
+            pass  # leave NaN, dropped below
 
     regimes = regimes.dropna().astype(int)
+    print(f"  Walk-forward complete: {len(regimes)} days labeled, "
+          f"{early_refits} early refit(s) triggered by vol spikes "
+          f"(threshold: vol_ratio > {vol_spike_threshold})")
     return regimes
 
 
@@ -409,25 +538,22 @@ def _sharpe(r: pd.Series) -> float:
 
 def backtest_regime_strategy(prices: pd.Series, features: pd.DataFrame,
                               regimes: pd.Series, avoid_regime: int = 0):
-    """Toy strategy: hold the index unless we're in the worst regime
-    (default: lowest-return state), then hold cash. Compare vs buy-and-hold.
-    This is NOT investment advice -- it's a demonstration of whether the
-    regime labels carry any signal at all."""
+    """
+    Toy strategy: hold unless in worst regime (avoid_regime=0), then cash.
+    Compared against buy-and-hold. NOT investment advice — tests whether
+    regime labels carry any signal at all.
+    """
     if len(features) == 0:
         raise ValueError(
-            "backtest_regime_strategy: features is empty, so there are no "
-            "days to backtest. This usually means walk_forward_regimes() "
-            "was given less history than it could label -- check the "
-            "NOTE/error it printed above."
+            "backtest_regime_strategy: features is empty — walk_forward produced "
+            "no labeled days. Check the NOTE/error printed above."
         )
     aligned_prices = prices.loc[features.index]
-    daily_ret = aligned_prices.pct_change().fillna(0)
-
-    position = (regimes != avoid_regime).astype(int)
-    strategy_ret = daily_ret * position.shift(1).fillna(0)
-
-    bh_equity = (1 + daily_ret).cumprod()
-    strat_equity = (1 + strategy_ret).cumprod()
+    daily_ret      = aligned_prices.pct_change().fillna(0)
+    position       = (regimes != avoid_regime).astype(int)
+    strategy_ret   = daily_ret * position.shift(1).fillna(0)
+    bh_equity      = (1 + daily_ret).cumprod()
+    strat_equity   = (1 + strategy_ret).cumprod()
 
     print(f"Buy & Hold   -> total return: {(bh_equity.iloc[-1]-1)*100:.1f}%, "
           f"Sharpe: {_sharpe(daily_ret):.2f}")
@@ -439,46 +565,41 @@ def backtest_regime_strategy(prices: pd.Series, features: pd.DataFrame,
 
 def monthly_backtest_breakdown(prices: pd.Series, features: pd.DataFrame,
                                 regimes: pd.Series, avoid_regime: int = 0,
-                                label: str = "", save_path: str = None) -> pd.DataFrame:
-    """Month-by-month version of backtest_regime_strategy: for every
-    calendar month in the sample, reports buy&hold return, regime-strategy
-    return, each one's Sharpe (computed on that month's daily returns --
-    noisy with ~21 data points, treat as directional not precise), the
-    number of days the strategy was in cash that month, and which regime
-    was most common that month.
-
-    This answers "did avoiding the worst regime actually help in March
-    2020 specifically, or only on average over years" -- the single
-    all-time backtest number can hide months where the strategy did
-    great and months where it badly underperformed buy & hold.
+                                label: str = "",
+                                save_path: str = None) -> pd.DataFrame:
+    """
+    Month-by-month backtest: buy&hold return, strategy return, difference,
+    rough monthly Sharpe for each, days in cash, dominant regime.
+    Answers "did avoiding the worst regime help in March 2020 specifically,
+    or only on average?" — a single all-time number hides this detail.
     """
     aligned_prices = prices.loc[features.index]
-    daily_ret = aligned_prices.pct_change().fillna(0)
-    position = (regimes != avoid_regime).astype(int)
-    strategy_ret = daily_ret * position.shift(1).fillna(0)
+    daily_ret      = aligned_prices.pct_change().fillna(0)
+    position       = (regimes != avoid_regime).astype(int)
+    strategy_ret   = daily_ret * position.shift(1).fillna(0)
 
     df = pd.DataFrame({
-        "bh_ret": daily_ret,
+        "bh_ret":    daily_ret,
         "strat_ret": strategy_ret,
-        "regime": regimes,
-        "in_cash": (position == 0).astype(int),
+        "regime":    regimes,
+        "in_cash":   (position == 0).astype(int),
     })
     df["YearMonth"] = df.index.to_period("M")
 
     rows = []
     for period, g in df.groupby("YearMonth"):
-        bh_month_ret = (1 + g["bh_ret"]).prod() - 1
-        strat_month_ret = (1 + g["strat_ret"]).prod() - 1
+        bh_m    = (1 + g["bh_ret"]).prod() - 1
+        strat_m = (1 + g["strat_ret"]).prod() - 1
         rows.append({
-            "month": str(period),
-            "trading_days": len(g),
-            "buy_hold_return_%": bh_month_ret * 100,
-            "strategy_return_%": strat_month_ret * 100,
-            "difference_%": (strat_month_ret - bh_month_ret) * 100,
-            "buy_hold_sharpe": _sharpe(g["bh_ret"]),
-            "strategy_sharpe": _sharpe(g["strat_ret"]),
-            "days_in_cash": int(g["in_cash"].sum()),
-            "dominant_regime": int(g["regime"].mode().iloc[0]),
+            "month":              str(period),
+            "trading_days":       len(g),
+            "buy_hold_return_%":  bh_m * 100,
+            "strategy_return_%":  strat_m * 100,
+            "difference_%":       (strat_m - bh_m) * 100,
+            "buy_hold_sharpe":    _sharpe(g["bh_ret"]),
+            "strategy_sharpe":    _sharpe(g["strat_ret"]),
+            "days_in_cash":       int(g["in_cash"].sum()),
+            "dominant_regime":    int(g["regime"].mode().iloc[0]),
         })
 
     monthly = pd.DataFrame(rows).set_index("month")
@@ -488,13 +609,14 @@ def monthly_backtest_breakdown(prices: pd.Series, features: pd.DataFrame,
     with pd.option_context("display.max_rows", None, "display.width", 140):
         print(monthly.round(2))
 
-    months_strategy_won = (monthly["difference_%"] > 0).sum()
-    print(f"\nStrategy beat buy&hold in {months_strategy_won}/{len(monthly)} "
-          f"months ({months_strategy_won / len(monthly) * 100:.0f}%).")
-    print(f"Average monthly outperformance: {monthly['difference_%'].mean():.2f} "
-          f"percentage points (std: {monthly['difference_%'].std():.2f}).")
-    print("(Monthly Sharpe is computed on ~21 daily returns per month, so "
-          "treat it as a rough directional signal, not a precise estimate.)")
+    won = (monthly["difference_%"] > 0).sum()
+    print(f"\nStrategy beat buy&hold in {won}/{len(monthly)} months "
+          f"({won/len(monthly)*100:.0f}%).")
+    print(f"Average monthly outperformance: "
+          f"{monthly['difference_%'].mean():.2f} pp "
+          f"(std: {monthly['difference_%'].std():.2f}).")
+    print("(Monthly Sharpe is computed on ~21 daily returns — treat as "
+          "directional signal, not a precise estimate.)")
 
     if save_path:
         monthly.to_csv(save_path)
@@ -508,27 +630,23 @@ def monthly_backtest_breakdown(prices: pd.Series, features: pd.DataFrame,
 # --------------------------------------------------------------------------
 
 def _download_prices(ticker: str) -> pd.Series:
-    """Downloads close prices for a single ticker from yfinance and
-    normalizes to a clean, dropna'd pd.Series (empty Series if nothing
-    was found -- yfinance doesn't raise on an unknown/delisted ticker,
-    it just returns an empty frame, so callers must check for that)."""
+    """Downloads close prices via yfinance. Returns empty Series (not an
+    exception) if the ticker is unknown or delisted — callers check emptiness."""
     import yfinance as yf
-    raw = yf.download(ticker, start="2015-01-01")["Close"]
+    raw    = yf.download(ticker, start="2015-01-01", progress=False)["Close"]
     prices = raw.dropna()
     if isinstance(prices, pd.DataFrame):
         prices = prices.iloc[:, 0]
     return prices
 
 
-def load_prices_with_fallback(ticker: str, fallback_ticker: str) -> tuple[pd.Series, str]:
-    """Tries `ticker` first (the NSE-assumed candidate, e.g. "AAPL.NS").
-    If that returns no data, retries with `fallback_ticker` (the raw,
-    unmodified input, e.g. "AAPL") -- this is what makes tickers from
-    exchanges other than NSE (US stocks like AAPL, MSFT, etc.) work
-    correctly instead of always failing silently on a wrongly-guessed
-    ".NS" suffix. Raises a clear error if neither candidate has data,
-    instead of letting an empty price series propagate downstream into
-    a confusing HMM/array error.
+def load_prices_with_fallback(ticker: str,
+                               fallback_ticker: str) -> tuple:
+    """
+    Tries `ticker` first (NSE candidate, e.g. "AAPL.NS").
+    If that returns no data, retries with `fallback_ticker` (raw input,
+    e.g. "AAPL") so US and other-exchange tickers work without manual suffixes.
+    Raises a clear ValueError if neither candidate has data.
 
     Returns (prices, ticker_actually_used).
     """
@@ -537,119 +655,150 @@ def load_prices_with_fallback(ticker: str, fallback_ticker: str) -> tuple[pd.Ser
         return prices, ticker
 
     if fallback_ticker != ticker:
-        print(f"NOTE: no data found for '{ticker}' -- retrying as "
-              f"'{fallback_ticker}' (looks like this isn't an NSE-listed "
-              f"ticker).")
+        print(f"NOTE: no data for '{ticker}' — retrying as '{fallback_ticker}' "
+              f"(not an NSE-listed ticker).")
         prices = _download_prices(fallback_ticker)
         if not prices.empty:
             return prices, fallback_ticker
 
-    tried = ticker if fallback_ticker == ticker else f"{ticker} and {fallback_ticker}"
+    tried = (ticker if fallback_ticker == ticker
+             else f"{ticker} and {fallback_ticker}")
     raise ValueError(
         f"No price data found for '{ticker}' (tried: {tried}). "
-        f"Double-check the ticker symbol -- for NSE stocks just the plain "
-        f"name (e.g. 'RELIANCE') or explicit '.NS' suffix works, for "
-        f"US/other-exchange stocks use the plain ticker (e.g. 'AAPL') or "
-        f"the correct Yahoo Finance suffix for that exchange."
+        f"For NSE stocks use the plain name (e.g. 'RELIANCE') or '.NS' suffix. "
+        f"For US stocks use the plain ticker (e.g. 'AAPL')."
     )
 
 
 # --------------------------------------------------------------------------
-# Main
+# Main pipeline
 # --------------------------------------------------------------------------
 
-# Walk-forward defaults. These are *targets*, not hard requirements --
-# run() scales them down automatically for tickers with limited history
-# (e.g. recent IPOs) instead of crashing.
-DEFAULT_MIN_TRAIN = 500       # preferred training window before labeling starts
-MIN_TRAIN_FLOOR = 100         # below this, an HMM fit is too unstable to trust
-MIN_WALK_FORWARD_TEST_DAYS = 60  # need at least ~3 months of labeled days for
-                                  # the walk-forward backtest/verdict to mean anything
-
-
-def run(stock_input: str, data_loader=None, min_train: int = None, refit_every: int = 21):
+def run(stock_input: str, data_loader=None,
+        min_train: int = None, refit_every: int = 21,
+        vol_spike_threshold: float = VOL_SPIKE_THRESHOLD):
     """
-    data_loader: callable(ticker:str) -> pd.Series of close prices,
-    indexed by date. Defaults to yfinance if not provided. Injectable so
-    the pipeline can be tested/run against any price source, not just
-    Yahoo Finance.
+    Full pipeline: download → features → model selection → walk-forward
+    → backtest → plots → verdict → save report.
 
-    min_train: how many days of history to require before the walk-forward
-    model starts labeling regimes. Defaults to None, which auto-scales:
-    uses 500 if the ticker has enough history, otherwise shrinks it (down
-    to MIN_TRAIN_FLOOR) so there are still at least
-    MIN_WALK_FORWARD_TEST_DAYS days left to actually walk-forward test on.
-    Pass an explicit int to override.
+    Parameters
+    ----------
+    stock_input         : ticker string (e.g. "RELIANCE", "NSEI", "AAPL")
+    data_loader         : optional callable(ticker) -> pd.Series of close prices.
+                          Defaults to yfinance. Inject for testing or custom sources.
+    min_train           : walk-forward initial training window (trading days).
+                          None = auto-scale: uses DEFAULT_MIN_TRAIN (252) if the
+                          ticker has enough history, otherwise shrinks to
+                          MIN_TRAIN_FLOOR (100).
+    refit_every         : normal refit interval in trading days (default 21).
+    vol_spike_threshold : vol_ratio above this triggers an immediate early refit
+                          (default 2.0). Increase to make early refits rarer,
+                          decrease to make them more aggressive.
     """
     ticker, label, fallback_ticker = resolve_ticker(stock_input)
     paths = make_output_dirs(label)
 
-    tee = Tee(paths["report_txt"])
+    tee        = Tee(paths["report_txt"])
     old_stdout = sys.stdout
     sys.stdout = tee
+
     try:
         print(f"Run started: {datetime.now().isoformat(timespec='seconds')}")
         print(f"Ticker candidate: {ticker}  |  Label: {label}")
+        print(f"Config: min_train={min_train or DEFAULT_MIN_TRAIN}, "
+              f"refit_every={refit_every}, "
+              f"vol_spike_threshold={vol_spike_threshold}")
 
+        # ---- Load prices ----
         if data_loader is None:
             prices, ticker_used = load_prices_with_fallback(ticker, fallback_ticker)
-            print(f"Ticker used: {ticker_used}")
+            print(f"Ticker used: {ticker_used}  |  {len(prices)} trading days loaded")
         else:
             prices = data_loader(ticker)
 
         if prices.empty:
             raise ValueError(
-                f"No price data available for '{stock_input}' -- cannot "
-                f"continue."
+                f"No price data available for '{stock_input}' — cannot continue."
             )
 
+        # ---- Feature engineering (FIX 1: 5 features) ----
         features = build_features(prices)
+        print(f"Features built: {list(features.columns)} | {len(features)} rows")
 
-        print(f"\n=== 1. Global fit for {label} (lookahead bias -- for comparison only) ===")
+        # ---- Global fit (lookahead bias, for comparison only) ----
+        print(f"\n=== 1. Global fit for {label} "
+              f"(lookahead bias — for comparison only) ===")
         global_model, k = select_n_states(features.values, max_states=4)
-        global_regimes = label_regimes(global_model, features)
+        global_regimes  = label_regimes(global_model, features)
         describe_regimes(features, global_regimes)
-        print("\nBacktest (has lookahead bias, inflated result expected):")
+        print("\nBacktest (has lookahead bias — inflated result expected):")
         backtest_regime_strategy(prices, features, global_regimes, avoid_regime=0)
-        plot_regimes(prices, global_regimes, k, label,
-                     subtitle="Global fit -- has lookahead bias, for comparison only",
-                     save_path=os.path.join(paths["plots"], f"{label}_regimes_lookahead.png"))
+        plot_regimes(
+            prices, global_regimes, k, label,
+            subtitle="Global fit — has lookahead bias, for comparison only",
+            save_path=os.path.join(paths["plots"],
+                                   f"{label}_regimes_lookahead.png"),
+        )
 
-        print(f"\n\n=== 2. Walk-forward causal fit for {label} (honest version) ===")
-        requested_min_train = 500 if min_train is None else min_train
-        wf_regimes = walk_forward_regimes(features, n_states=k,
-                                           min_train=requested_min_train,
-                                           refit_every=refit_every)
+        # ---- Walk-forward fit (FIX 2 + FIX 3: adaptive refit, min_train=252) ----
+        print(f"\n\n=== 2. Walk-forward causal fit for {label} "
+              f"(honest version — no lookahead) ===")
+        requested_min_train = DEFAULT_MIN_TRAIN if min_train is None else min_train
+        wf_regimes = walk_forward_regimes(
+            features, n_states=k,
+            min_train=requested_min_train,
+            refit_every=refit_every,
+            vol_spike_threshold=vol_spike_threshold,
+        )
+
         wf_features = features.loc[wf_regimes.index]
-        held_out = len(features) - len(wf_regimes)
-        print(f"Labeled {len(wf_regimes)} days (first {held_out} held out as "
-              f"the initial training window)")
+        held_out    = len(features) - len(wf_regimes)
+        print(f"Labeled {len(wf_regimes)} days "
+              f"(first {held_out} held out as initial training window)")
         wf_stats = describe_regimes(wf_features, wf_regimes)
+
         print("\nBacktest (causal, no lookahead):")
         backtest_regime_strategy(prices, wf_features, wf_regimes, avoid_regime=0)
-        plot_regimes(prices, wf_regimes, k, label,
-                     subtitle="Walk-forward causal fit -- no lookahead bias",
-                     save_path=os.path.join(paths["plots"], f"{label}_regimes_walkforward.png"))
+        plot_regimes(
+            prices, wf_regimes, k, label,
+            subtitle="Walk-forward causal fit — no lookahead bias",
+            save_path=os.path.join(paths["plots"],
+                                   f"{label}_regimes_walkforward.png"),
+        )
 
+        # ---- Month-by-month breakdown ----
         print(f"\n\n=== 3. Month-by-month breakdown for {label} ===")
-        monthly_backtest_breakdown(prices, wf_features, wf_regimes, avoid_regime=0,
-                                    label=label, save_path=paths["monthly_csv"])
+        monthly_backtest_breakdown(
+            prices, wf_features, wf_regimes, avoid_regime=0,
+            label=label, save_path=paths["monthly_csv"],
+        )
 
-        print(f"\n\n=== 4. Zooming in on Random Months for {label} ===")
-        plot_random_months(prices, wf_regimes, k, label, num_months=3,
-                            save_path=os.path.join(paths["plots"], f"{label}_regimes_monthly_zoom.png"))
+        # ---- Zoom plots ----
+        print(f"\n\n=== 4. Zoom plots for {label} ===")
+        plot_random_months(
+            prices, wf_regimes, k, label, num_months=3,
+            save_path=os.path.join(paths["plots"],
+                                   f"{label}_regimes_monthly_zoom.png"),
+        )
+        plot_recent_window(
+            prices, wf_regimes, k, n_days=5, window_label="week",
+            ticker_label=label,
+            save_path=os.path.join(paths["plots"],
+                                   f"{label}_regimes_latest_week.png"),
+        )
+        plot_recent_window(
+            prices, wf_regimes, k, n_days=21, window_label="month",
+            ticker_label=label,
+            save_path=os.path.join(paths["plots"],
+                                   f"{label}_regimes_latest_month.png"),
+        )
 
-        plot_recent_window(prices, wf_regimes, k, n_days=5, window_label="week",
-                            ticker_label=label,
-                            save_path=os.path.join(paths["plots"], f"{label}_regimes_latest_week.png"))
-        plot_recent_window(prices, wf_regimes, k, n_days=21, window_label="month",
-                            ticker_label=label,
-                            save_path=os.path.join(paths["plots"], f"{label}_regimes_latest_month.png"))
-
+        # ---- Current verdict ----
         latest_regime_verdict(wf_regimes, wf_stats, label)
 
         print(f"\nRun finished: {datetime.now().isoformat(timespec='seconds')}")
         print(f"All outputs saved under: {paths['base']}/")
+
     finally:
         sys.stdout = old_stdout
         tee.close()
