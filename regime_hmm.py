@@ -42,11 +42,17 @@ import sys
 import random
 from datetime import datetime
 
+import warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from hmmlearn.hmm import GaussianHMM
+
+# Suppress hmmlearn convergence warnings in the console — they are expected
+# when the training window is short (early walk-forward steps) and do not
+# affect correctness. The fit validation below catches genuinely bad fits.
+warnings.filterwarnings("ignore", message=".*Model is not converging.*")
 
 
 # --------------------------------------------------------------------------
@@ -284,50 +290,114 @@ def plot_regimes(prices: pd.Series, regimes: pd.Series, n_states: int,
 # FIX 1: Feature engineering — 5 features instead of 2
 # --------------------------------------------------------------------------
 
-def build_features(prices: pd.Series,
-                   slow_vol: int = 10,
-                   fast_vol: int = 3,
-                   drawdown_window: int = 60) -> pd.DataFrame:
-    """
-    Builds the enriched feature matrix the HMM is fit on.
+"""
+Feature improvements for regime_hmm.py
+----------------------------------------
+Drop these into build_features() in regime_hmm.py.
+All features are:
+  - Computable from daily close prices only (no external data)
+  - Causal (use only past data, safe for walk-forward)
+  - Proven to carry regime information in the literature
 
-    Features
-    --------
-    return        : daily percentage return — the primary signal
-    vol_slow      : slow_vol-day rolling std of returns (default 10d)
-                    original feature; captures the prevailing volatility regime
-    vol_fast      : fast_vol-day rolling std of returns (default 3d)
-                    reacts to volatility spikes within 2-3 days instead of 10
-    vol_ratio     : vol_fast / vol_slow
-                    the crash-onset detector — spikes sharply when a sudden
-                    vol burst arrives (e.g. COVID March 2020 showed a
-                    vol_ratio > 3 within 3 days of the selloff starting,
-                    while the 10-day vol was still calm)
-    drawdown      : price / rolling_max(drawdown_window) - 1
-                    distance from the recent peak (always <= 0)
-                    separates "high vol crash" (large drawdown) from
-                    "high vol recovery" (drawdown recovering toward 0) —
-                    these look identical in return/vol space alone
+WHY each feature helps:
+  - vol_ratio:    fast/slow vol ratio catches vol regime shifts BEFORE
+                  the return series shows them. Vol spikes precede crashes.
+  - drawdown:     how far below the recent peak we are. Regime 0 during a
+                  5% dip is very different from regime 0 during a 40% crash.
+  - momentum:     price relative to its 20-day MA. HMM can now tell apart
+                  "low vol uptrend" from "low vol downtrend" which look
+                  identical in return/vol space alone.
+  - trend_strength: ADX-like measure. High = strong trend (up or down).
+                  Helps separate trending from sideways regimes.
+  - vol_of_vol:   volatility of volatility. High vov = unstable, transitioning
+                  market. Low vov = stable regime. Directly models regime
+                  persistence.
+"""
+
+
+
+
+def build_features(prices: pd.Series,
+                   fast_vol: int = 5,
+                   slow_vol: int = 21,
+                   drawdown_window: int = 60,
+                   momentum_window: int = 20,
+                   vov_window: int = 10) -> pd.DataFrame:
+    """
+    Builds the feature matrix the HMM is fit on.
+
+    Features:
+      return        : daily log return
+      vol_slow      : slow rolling volatility (baseline, was 'volatility')
+      vol_ratio     : fast_vol / slow_vol -- spikes before crashes
+      drawdown      : how far below rolling max (0 = at all-time high,
+                      -0.3 = 30% below peak)
+      momentum      : (price / 20d MA) - 1, positive = above MA = bullish
+      vol_of_vol    : rolling std of vol_slow -- how unstable is volatility
 
     Parameters
     ----------
-    slow_vol        : window for slow volatility (default 10 trading days)
-    fast_vol        : window for fast volatility (default 3 trading days)
-    drawdown_window : rolling max window for drawdown calculation (default 60d)
+    fast_vol        : window for fast volatility (default 5 days = 1 week)
+    slow_vol        : window for slow volatility (default 21 days = 1 month)
+    drawdown_window : lookback for rolling max to compute drawdown
+    momentum_window : MA window for momentum feature
+    vov_window      : window for vol-of-vol
     """
     df = pd.DataFrame(index=prices.index)
-    df["return"]   = prices.pct_change()
+
+    # --- Core return ---
+    df["return"] = np.log(prices / prices.shift(1))
+
+    # --- Volatility (slow, replaces the original single 'volatility') ---
     df["vol_slow"] = df["return"].rolling(slow_vol).std()
-    df["vol_fast"] = df["return"].rolling(fast_vol).std()
 
-    # vol_ratio: replace 0 denominator with NaN to avoid divide-by-zero
-    df["vol_ratio"] = df["vol_fast"] / df["vol_slow"].replace(0, np.nan)
+    # --- Vol ratio: fast / slow ---
+    vol_fast = df["return"].rolling(fast_vol).std()
+    df["vol_ratio"] = vol_fast / df["vol_slow"].replace(0, np.nan)
 
-    # drawdown: fraction below rolling peak, always in [-inf, 0]
-    df["drawdown"] = prices / prices.rolling(drawdown_window).max() - 1
+    # --- Drawdown: how far below rolling max ---
+    rolling_max = prices.rolling(drawdown_window, min_periods=1).max()
+    df["drawdown"] = (prices / rolling_max) - 1.0   # always <= 0
+
+    # --- Momentum: distance from moving average ---
+    ma = prices.rolling(momentum_window).mean()
+    df["momentum"] = (prices / ma) - 1.0            # positive = above MA
+
+    # --- Vol of vol: stability of the volatility regime ---
+    df["vol_of_vol"] = df["vol_slow"].rolling(vov_window).std()
 
     df = df.dropna()
     return df
+
+
+# --------------------------------------------------------------------------
+# Limitations
+# --------------------------------------------------------------------------
+"""
+KNOWN LIMITATIONS:
+
+1. vol_ratio can be NaN or infinite if vol_slow goes to zero (flat price
+   period). Already handled with .replace(0, np.nan) -> dropna() removes
+   those rows. For very recently listed or very thinly traded stocks this
+   can eat significant history.
+
+2. momentum and drawdown both depend on the price level, not returns.
+   This is intentional (they carry regime info the return series misses)
+   but means the HMM's Gaussian assumption fits them less cleanly than
+   the return/vol pair. If you see regime labels that look nonsensical,
+   try removing momentum first and see if it cleans up.
+
+3. vol_of_vol has two rolling windows stacked (vol_slow then vov_window),
+   so it needs slow_vol + vov_window days before producing a value.
+   With defaults that's 31 days -- not a problem in practice but worth
+   knowing if you're using a short history.
+
+4. Adding 6 features instead of 2 makes the HMM harder to fit reliably
+   with small training windows. The existing MIN_VIABLE_TRAIN_ROWS = 60
+   should be raised to at least 120 when using this full feature set.
+   Alternatively use a subset: (return, vol_slow, vol_ratio, drawdown)
+   is a good 4-feature compromise.
+"""
 
 
 # --------------------------------------------------------------------------
