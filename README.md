@@ -139,9 +139,11 @@ python regime_filters.py
 HMMs fitted for k=2 to 4 states. Best k selected by BIC (lower = better fit penalized for complexity). States relabeled 0..k-1 by mean return so labels are human-interpretable and comparable across tickers.
 
 ### Walk-Forward (Causal, No Lookahead)
-- Train on expanding window of past data only
+- Train on event-anchored window of past data (resets at major regime shifts)
 - Refit every 21 trading days (normal schedule)
 - **Adaptive refit:** immediately when `vol_ratio > 2.0` — crash onset detection
+- **Event-anchored reset:** major transitions (e.g., crash entry / sharp crash recovery) reset `train_start_idx` so old regime cycles are dropped
+- **Reset cooldown:** `min_days_before_reset=252` avoids frequent reset thrashing
 - Validate every fit before accepting (checks for NaN parameters)
 - First `min_train=252` days held out as initial training window
 
