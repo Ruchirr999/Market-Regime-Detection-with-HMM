@@ -64,6 +64,7 @@ DEFAULT_MIN_TRAIN       = 252   # FIX 3: reduced from 500 to 1 trading year
 MIN_TRAIN_FLOOR         = 100   # hard floor even for short-history tickers
 MIN_WALK_FORWARD_TEST_DAYS = 60 # need ~3 months of labeled days to be meaningful
 VOL_SPIKE_THRESHOLD     = 2.0   # FIX 2: vol_ratio above this triggers early refit
+DEFAULT_MIN_DAYS_BEFORE_RESET = 252  # event-anchor cooldown to avoid reset thrashing
 
 
 # --------------------------------------------------------------------------
@@ -466,17 +467,45 @@ def describe_regimes(features: pd.DataFrame, regimes: pd.Series):
 # FIX 2: Adaptive walk-forward with vol-spike-triggered early refit
 # --------------------------------------------------------------------------
 
+def transition_detector(previous_regime: int, current_regime: int,
+                        n_states: int, major_jump: int = 2):
+    """
+    Detect major regime transitions that should reset the walk-forward window.
+
+    Major transitions are:
+      - Entering crash regime: non-crash -> 0
+      - Sharp recovery from crash: 0 -> top regimes
+      - Any large regime jump (abs delta >= major_jump)
+    """
+    if previous_regime is None or current_regime is None:
+        return False, ""
+    if previous_regime == current_regime:
+        return False, ""
+
+    if current_regime == 0 and previous_regime > 0:
+        return True, f"entered crash regime ({previous_regime} -> 0)"
+
+    recovery_floor = max(1, n_states - 2)
+    if previous_regime == 0 and current_regime >= recovery_floor:
+        return True, f"sharp recovery from crash ({previous_regime} -> {current_regime})"
+
+    if abs(current_regime - previous_regime) >= major_jump:
+        return True, f"major regime jump ({previous_regime} -> {current_regime})"
+
+    return False, ""
+
+
 def walk_forward_regimes(features: pd.DataFrame, n_states: int,
                           min_train: int = DEFAULT_MIN_TRAIN,
                           refit_every: int = 21,
                           n_iter: int = 100,
-                          vol_spike_threshold: float = VOL_SPIKE_THRESHOLD
+                          vol_spike_threshold: float = VOL_SPIKE_THRESHOLD,
+                          min_days_before_reset: int = DEFAULT_MIN_DAYS_BEFORE_RESET
                           ) -> pd.Series:
     """
     Causal walk-forward HMM labeling with adaptive refitting.
 
     Standard behaviour (inherited from previous version):
-      - Train on expanding window of past data only (no lookahead).
       - Refit the HMM every `refit_every` trading days.
       - Validate each fit before accepting (checks for NaN params).
       - If a fit fails, keep the previous valid model.
@@ -492,6 +521,12 @@ def walk_forward_regimes(features: pd.DataFrame, n_states: int,
         If it doesn't (e.g. custom feature set), adaptive refitting is
         skipped silently and the fixed schedule applies.
 
+    New (event-anchored walk-forward):
+      - Track major transitions between mapped regimes (crash entry/recovery).
+      - On major transition, reset the training start index to that day.
+      - Future fits use only data from this reset point onward.
+      - `min_days_before_reset` enforces cooldown between resets.
+
     Parameters
     ----------
     features              : DataFrame from build_features()
@@ -502,6 +537,8 @@ def walk_forward_regimes(features: pd.DataFrame, n_states: int,
     n_iter                : HMM EM iterations per fit (default 100)
     vol_spike_threshold   : vol_ratio value above which early refit fires
                             (default 2.0 — fast vol > 2x slow vol)
+    min_days_before_reset : minimum days between event-anchored resets
+                            to avoid frequent whipsaw resets (default 252)
     """
     values = features.values
     n      = len(values)
@@ -536,8 +573,44 @@ def walk_forward_regimes(features: pd.DataFrame, n_states: int,
     return_col = features.columns.get_loc("return")
 
     early_refits = 0  # track how many vol-spike refits fired (for reporting)
+    reset_count = 0
+    blocked_resets = 0
+    train_start_idx = 0
+    last_reset_idx = 0
+    previous_regime = None
 
     for t in range(min_train, n):
+
+        if model is not None and remap is not None:
+            try:
+                cycle_window = values[train_start_idx:t + 1]
+                cycle_state_seq = model.predict(cycle_window)
+                current_regime = remap[cycle_state_seq[-1]]
+            except Exception:
+                current_regime = None
+
+            major_shift, shift_reason = transition_detector(
+                previous_regime, current_regime, n_states
+            )
+            if major_shift:
+                days_since_reset = t - last_reset_idx
+                if days_since_reset >= min_days_before_reset:
+                    reset_count += 1
+                    train_start_idx = t
+                    last_reset_idx = t
+                    model = None
+                    remap = None
+                    last_refit = -1
+                    previous_regime = None
+                    print(f"  [walk_forward] Reset #{reset_count} at {features.index[t]} "
+                          f"due to {shift_reason}. "
+                          f"New train window starts at index {t}.")
+                    continue
+                else:
+                    blocked_resets += 1
+                    print(f"  [walk_forward] Transition detected at {features.index[t]} "
+                          f"({shift_reason}) but reset skipped "
+                          f"(cooldown: {days_since_reset}/{min_days_before_reset} days).")
 
         # ---- Decide whether to refit ----
         vol_spike = (
@@ -552,7 +625,9 @@ def walk_forward_regimes(features: pd.DataFrame, n_states: int,
             if vol_spike and not scheduled:
                 early_refits += 1
 
-            train_data = values[:t]
+            train_data = values[train_start_idx:t]
+            if len(train_data) < MIN_VIABLE_TRAIN_ROWS:
+                continue
             candidate  = GaussianHMM(n_components=n_states,
                                      covariance_type="diag",
                                      n_iter=n_iter, random_state=42)
@@ -585,16 +660,20 @@ def walk_forward_regimes(features: pd.DataFrame, n_states: int,
             continue
 
         try:
-            window    = values[:t + 1]
+            window    = values[train_start_idx:t + 1]
             state_seq = model.predict(window)
-            regimes.iloc[t] = remap[state_seq[-1]]
+            mapped_state = remap[state_seq[-1]]
+            regimes.iloc[t] = mapped_state
+            previous_regime = mapped_state
         except Exception:
             pass  # leave NaN, dropped below
 
     regimes = regimes.dropna().astype(int)
     print(f"  Walk-forward complete: {len(regimes)} days labeled, "
           f"{early_refits} early refit(s) triggered by vol spikes "
-          f"(threshold: vol_ratio > {vol_spike_threshold})")
+          f"(threshold: vol_ratio > {vol_spike_threshold}), "
+          f"{reset_count} event-anchored reset(s), "
+          f"{blocked_resets} blocked by cooldown")
     return regimes
 
 
@@ -746,7 +825,8 @@ def load_prices_with_fallback(ticker: str,
 
 def run(stock_input: str, data_loader=None,
         min_train: int = None, refit_every: int = 21,
-        vol_spike_threshold: float = VOL_SPIKE_THRESHOLD):
+        vol_spike_threshold: float = VOL_SPIKE_THRESHOLD,
+        min_days_before_reset: int = DEFAULT_MIN_DAYS_BEFORE_RESET):
     """
     Full pipeline: download → features → model selection → walk-forward
     → backtest → plots → verdict → save report.
@@ -764,6 +844,8 @@ def run(stock_input: str, data_loader=None,
     vol_spike_threshold : vol_ratio above this triggers an immediate early refit
                           (default 2.0). Increase to make early refits rarer,
                           decrease to make them more aggressive.
+    min_days_before_reset : minimum days between event-anchored reset events
+                            (default 252).
     """
     ticker, label, fallback_ticker = resolve_ticker(stock_input)
     paths = make_output_dirs(label)
@@ -777,7 +859,8 @@ def run(stock_input: str, data_loader=None,
         print(f"Ticker candidate: {ticker}  |  Label: {label}")
         print(f"Config: min_train={min_train or DEFAULT_MIN_TRAIN}, "
               f"refit_every={refit_every}, "
-              f"vol_spike_threshold={vol_spike_threshold}")
+              f"vol_spike_threshold={vol_spike_threshold}, "
+              f"min_days_before_reset={min_days_before_reset}")
 
         # ---- Load prices ----
         if data_loader is None:
@@ -819,6 +902,7 @@ def run(stock_input: str, data_loader=None,
             min_train=requested_min_train,
             refit_every=refit_every,
             vol_spike_threshold=vol_spike_threshold,
+            min_days_before_reset=min_days_before_reset,
         )
 
         wf_features = features.loc[wf_regimes.index]
